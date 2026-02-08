@@ -8,7 +8,7 @@ export default function HomeAbout(): ReactNode {
     <section className={styles.aboutSection}>
       <div className={`container ${styles.inner}`}>
         <Heading as="h2" className={styles.title}>
-          О дисциплине
+          О сайте
         </Heading>
         <p className={styles.aboutText}>
           Сайт содержит учебные материалы по дисциплине «Структуры и алгоритмы в базах данных
