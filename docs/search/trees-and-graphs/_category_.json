@@ -1,0 +1,9 @@
+{
+  "label": "Деревья и графы",
+  "position": 2,
+  "link": {
+    "type": "generated-index",
+    "description": "5 minutes to learn the most important Docusaurus concepts.",
+    "slug": "/category/search/trees-and-graphs"
+  }
+}
