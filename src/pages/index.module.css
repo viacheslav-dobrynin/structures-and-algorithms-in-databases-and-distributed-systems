@@ -4,15 +4,32 @@
  */
 
 .heroBanner {
-  padding: 4rem 0;
+  padding: 5rem 0 4.5rem;
   text-align: center;
   position: relative;
   overflow: hidden;
+  background: linear-gradient(135deg, #2f6f49 0%, #3f8859 55%, #4e9b67 100%);
+}
+
+.heroBanner :global(.hero__title) {
+  margin: 0 auto;
+  max-width: 960px;
+  font-size: clamp(2rem, 3vw, 3.3rem);
+  line-height: 1.2;
+  font-weight: 800;
+}
+
+.heroBanner :global(.hero__subtitle) {
+  margin: 1rem auto 0;
+  max-width: 760px;
+  font-size: clamp(1.05rem, 1.5vw, 1.55rem);
+  line-height: 1.45;
+  opacity: 0.95;
 }
 
 @media screen and (max-width: 996px) {
   .heroBanner {
-    padding: 2rem;
+    padding: 3.25rem 1rem;
   }
 }
 
@@ -20,4 +37,17 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  margin-top: 1.75rem;
+}
+
+.buttons :global(.button) {
+  border-radius: 999px;
+  padding: 0.75rem 1.4rem;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+  transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+.buttons :global(.button:hover) {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgb(0 0 0 / 22%);
 }
