@@ -8,8 +8,15 @@ title: PostGIS
 ввиду его популярности.
 Для более глубокого ознакомления с PostGIS рекомендуется [воркшоп](https://postgis.net/workshops/postgis-intro/).
 
-## Docker Compose для PostGIS и pgAdmin
+## Подготовка окружения
 
+### Данные
+
+В качестве данных используется [набор](https://s3.amazonaws.com/s3.cleverelephant.ca/postgis-workshop-2020.zip) из вышеуказанного воркшопа.
+
+### Docker Compose для PostGIS и pgAdmin
+
+Разархивируйте вышеуказанный набор данных в рабочую директорию.
 Скопируйте конфигурацию ниже в файл `docker-compose.yml`.
 
 ```yaml title="docker-compose.yml"
@@ -30,6 +37,8 @@ services:
     container_name: pgadmin
     image: dpage/pgadmin4
     restart: unless-stopped
+    volumes:
+      - ./postgis-workshop/:/home
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
@@ -39,21 +48,81 @@ services:
       - "${PGADMIN_PORT:-5050}:80"
 ```
 
-## Запуск
+### Запуск
 
 ```bash
-docker compose up -d
+docker compose up -d # или podman-compose up -d
 ```
 
-## Доступ
+### Доступ
 
 - PostGIS: `localhost:5432`
 - pgAdmin: `http://localhost:5050`
 
-## Подключение в pgAdmin
+### Создание сервера в pgAdmin
 
-- Host: `postgis` (если pgAdmin запущен в том же compose)
+- Host: `postgis` (поскольку pgAdmin запущен в том же compose, а имя сервиса внутри Docker-сети используется как доменное имя)
 - Port: `5432`
 - Username: `postgres`
 - Password: `postgres`
 - Database: `spatial_lab`
+
+### Загрузка данных
+
+1. Нажмите правой кнопкой мыши на базу данных `spatial_lab`
+2. Нажмите `Restore`
+3. Выберите файл `nyc_data.backup`
+
+## Работа с пространственными данными
+
+Загруженный набор данных представляет собой данные о переписи населения
+в городе Нью-Йорк с привязкой этих данных к пространственным зонам.
+
+Рассмотрим пространственные данные для таблицы `nyc_census_blocks`, представляющей информацию о переписных блоках Нью-Йорка:
+
+```sql
+SELECT geom from nyc_census_blocks;
+```
+
+А также для таблицы `nyc_subway_stations`, содержащей информацию о станциях метро города:
+
+```sql
+SELECT geom from nyc_subway_stations;
+```
+
+Далее воспользуемся функцией `ST_Contains` расширения PostGIS, позволяющей
+определять, содержит ли одна геометрия другую.
+
+Для примера найдем все переписные блоки, в которых есть станции метро, название которых начинается с `B`:
+
+```sql
+SELECT blocks.geom
+ FROM nyc_census_blocks blocks
+ JOIN nyc_subway_stations subways
+ ON ST_Contains(blocks.geom, subways.geom)
+ WHERE subways.name LIKE 'B%';
+```
+
+Рассмотренные таблицы уже содержат пространственные индексы.
+
+Для наглядности удалим один из них и оценим время выполнения предыдущего запроса.
+
+```sql
+DROP INDEX nyc_census_blocks_geom_idx;
+```
+
+Время выполнения запроса без индекса составило 1 сек. 269 мс.
+(конкретное значение может отличаться в зависимости от машины, на которой выполняется запрос).
+
+Добавим индекс обратно:
+
+```sql
+CREATE INDEX nyc_census_blocks_geom_idx
+  ON nyc_census_blocks
+  USING GIST (geom);
+```
+
+Время выполнения того же запроса с индексом составило 100 мс.
+
+Хотя таблица `nyc_census_blocks` сравнительно небольшая, разница во времени значительна.
+С ростом объёма данных эффект от индекса будет только увеличиваться.
