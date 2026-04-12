@@ -222,18 +222,20 @@ R+-дерево (Sellis et al., 1987) решает проблему перекр
 
 ## Сложность
 
-| Операция           | Среднее время       | Худшее время       |
+| Операция           | Высота дерева  | Худшее время       |
 |--------------------|--------------------|-------------------|
-| Поиск              | `O(log_M n)`       | `O(n)`            |
 | Вставка            | `O(log_M n)`       | `O(n)`            |
 | Удаление           | `O(log_M n)`       | `O(n)`            |
+| Поиск              | не гарантируется   | `O(n)`            |
 | Пространство       | `O(n)`             | `O(n)`            |
 
 Здесь `n` — количество объектов, `M` — максимальная ёмкость узла.
 
-В среднем случае высота дерева равна `O(log_M n)`, и на каждом уровне просматривается ограниченное число узлов. Однако при сильном перекрытии MBR (что характерно для неравномерно распределённых данных) может потребоваться обход значительной части дерева, что приводит к линейной сложности в худшем случае.
+Высота дерева равна `O(log_M n)` — это гарантируется балансировкой. Вставка и удаление следуют единственному пути от корня до листа, поэтому их сложность определяется высотой.
 
-На практике при использовании R*-дерева перекрытия минимизированы, и производительность поиска близка к `O(log_M n)` для большинства реальных наборов данных.
+**Поиск — особый случай.** В отличие от B-дерева, поиск в R-дереве не имеет теоретической гарантии сублинейной сложности даже в среднем. При диапазонном запросе алгоритм обходит все поддеревья, MBR которых пересекаются с областью поиска. Если MBR узлов сильно перекрываются (что типично для неравномерно распределённых или кластеризованных данных), количество посещённых узлов может быть пропорционально `n`. Это фундаментальное отличие от одномерных индексов, где перекрытие невозможно.
+
+На практике R*-дерево минимизирует перекрытия за счёт улучшенного разбиения и принудительной повторной вставки, что даёт производительность поиска, близкую к `O(log_M n)`, для большинства реальных наборов пространственных данных — но это эмпирическое наблюдение, а не теоретическая гарантия [[1](#ref-guttman), [4](#ref-beckmann)].
 
 ## Применение в базах данных
 
@@ -258,3 +260,17 @@ SELECT * FROM my_table WHERE geom && ST_MakeEnvelope(0, 0, 10, 10);
 Функции вроде `ST_Contains`, `ST_Intersects`, `ST_DWithin` внутренне используют оператор `&&` для предварительной фильтрации по индексу, а затем выполняют точную геометрическую проверку.
 
 Подробнее о практическом использовании пространственных индексов в PostGIS см. раздел [PostGIS](./postgis.mdx).
+
+## Список литературы
+
+1. <a id="ref-guttman"></a> Guttman, A. (1984). **R-Trees: A Dynamic Index Structure for Spatial Searching**. Proceedings of the ACM SIGMOD International Conference on Management of Data, 47–57. [ACM Digital Library](https://dl.acm.org/doi/10.1145/602259.602266)
+
+2. <a id="ref-sellis"></a> Sellis, T., Roussopoulos, N., & Faloutsos, C. (1987). **The R+-Tree: A Dynamic Index for Multi-Dimensional Objects**. Proceedings of the 13th VLDB Conference, 507–518. [VLDB](http://www.vldb.org/conf/1987/P507.PDF)
+
+3. <a id="ref-beckmann"></a> Beckmann, N., Kriegel, H.-P., Schneider, R., & Seeger, B. (1990). **The R*-Tree: An Efficient and Robust Access Method for Points and Rectangles**. Proceedings of the ACM SIGMOD International Conference on Management of Data, 322–331. [Semantic Scholar](https://www.semanticscholar.org/paper/The-R*-tree%3A-an-efficient-and-robust-access-method-Beckmann-Kriegel/8041c62940015ef6cca1976545f97f47e738b0a2)
+
+4. <a id="ref-manolopoulos"></a> Manolopoulos, Y., Nanopoulos, A., Papadopoulos, A. N., & Theodoridis, Y. (2006). **R-Trees: Theory and Applications**. Springer. [Springer](https://link.springer.com/book/10.1007/978-1-4471-3748-0)
+
+5. <a id="ref-postgis"></a> PostGIS Project. **Introduction to PostGIS: Spatial Indexing**. [postgis.net](https://postgis.net/workshops/postgis-intro/indexing.html)
+
+6. <a id="ref-postgresql"></a> PostgreSQL Global Development Group. **PostgreSQL Documentation: GiST Indexes**. [postgresql.org](https://www.postgresql.org/docs/current/gist.html)
