@@ -371,7 +371,7 @@ CREATE INDEX idx_users_email ON users USING btree (email);
 
 B-tree индексы в PostgreSQL поддерживают операторы `=`, `<`, `<=`, `>`, `>=`, а также `IS NULL` / `IS NOT NULL`. Условия `BETWEEN` и `IN` планировщик сводит к этим базовым операторам. Кроме того, индекс используется для ускорения `ORDER BY` (данные хранятся в отсортированном порядке) и для префиксных `LIKE 'foo%'` / регулярок `~ '^foo'`, если использовать operator class `text_pattern_ops`. Планировщик применяет индекс для:
 
-- **Index Scan** — обход дерева + случайный доступ к кучи (heap), эффективен при высокой селективности.
+- **Index Scan** — обход дерева + случайный доступ к куче (heap), эффективен при высокой селективности.
 - **Index Only Scan** — если все нужные столбцы есть в индексе, обращение к куче не требуется. На практике heap всё равно может быть прочитан, если visibility map страницы не подтверждает, что все строки видимы всем транзакциям.
 - **Bitmap Index Scan** — при низкой селективности планировщик сначала строит битовую карту совпадений, затем читает страницы кучи в порядке их физических номеров, чтобы уменьшить число случайных обращений к диску.
 
@@ -383,7 +383,7 @@ B-tree индексы в PostgreSQL поддерживают операторы 
 
 2. Cormen, T. H., Leiserson, C. E., Rivest, R. L., & Stein, C. (2022). **Introduction to Algorithms** (4th ed.), Chapter 18: B-Trees. MIT Press.
 
-3. Ramakrishnan, R., & Gehrke, J. (2003). **Database Management Systems** (3rd ed.), Chapter 9: Tree-Structured Indexing. McGraw-Hill.
+3. Ramakrishnan, R., & Gehrke, J. (2003). **Database Management Systems** (3rd ed.), Chapter 10: Tree-Structured Indexing. McGraw-Hill.
 
 4. Graefe, G. (2011). **Modern B-Tree Techniques**. Foundations and Trends in Databases, 3(4), 203–402. [Now Publishers](https://doi.org/10.1561/1900000028)
 
