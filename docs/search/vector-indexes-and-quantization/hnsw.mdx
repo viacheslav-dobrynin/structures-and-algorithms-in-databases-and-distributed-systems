@@ -1,0 +1,495 @@
+---
+title: HNSW
+sidebar_position: 1
+---
+
+import ReactECharts from 'echarts-for-react';
+
+# HNSW
+
+## Мотивация
+
+Современные модели машинного обучения — языковые модели (BERT, GPT), модели для поиска изображений, модели рекомендательных систем — преобразуют объекты в **векторные представления** (embeddings) в многомерном евклидовом пространстве. Типичные размерности: 128, 384, 768, 1536, 3072. Задача поиска «похожих» объектов сводится к задаче **k-NN** (k Nearest Neighbors) в пространстве `R^d`: по запросу-вектору `q` найти `k` векторов базы, ближайших к `q` по заданной метрике (`L2`, косинусная, скалярное произведение).
+
+Для баз с миллионами и миллиардами векторов точный k-NN слишком дорог:
+
+- **Полный перебор** требует `O(n · d)` операций на запрос. При `n = 10^7` и `d = 768` это несколько секунд на одно обращение — неприемлемо для интерактивных систем.
+- **Классические пространственные индексы** — kd-дерево, [R-дерево](../spatial-indexes/r-tree.mdx), quad-tree — страдают от **«проклятия размерности»** (curse of dimensionality). Уже при `d ≈ 20` количество посещаемых узлов растёт экспоненциально и приближается к `n`. Причина — в многомерном пространстве расстояния между любыми парами точек становятся «почти равными», а объём разбиений неадекватно распределяется по подузлам. Те же аргументы, что делают [B-деревья](../trees-and-graphs/b-trees.mdx) эффективными в одномерном случае, в высоких размерностях перестают работать.
+
+Практический выход — **приближённый поиск ближайших соседей** (ANN, Approximate Nearest Neighbors): пожертвовать небольшой долей точности (recall) ради ускорения на порядки. Основные семейства ANN-индексов:
+
+- **Хеширующие** — LSH (Locality-Sensitive Hashing);
+- **Квантизационные / кластерные** — IVF (Inverted File), PQ (Product Quantization), их комбинации;
+- **Деревья** — Annoy (random projection forests), KD-forests;
+- **Графовые** — NSW, HNSW, Vamana / DiskANN.
+
+**HNSW** (Hierarchical Navigable Small World) предложен Ю. А. Малковым и Д. А. Яшуниным в 2016 году [[1](#ref-malkov-hnsw)] как развитие более ранней структуры NSW [[2](#ref-malkov-nsw)]. На сегодняшний день это один из наиболее широко используемых графовых ANN-индексов: он входит в ядро Qdrant, Weaviate, pgvector, Milvus, Elasticsearch, Redis, FAISS.
+
+## Навигация по графу: предшественник NSW
+
+### Small-world графы
+
+Граф называется **navigable small-world**, если в нём одновременно выполнены два свойства: низкий средний диаметр (`O(log n)` между двумя случайными вершинами) и высокий коэффициент кластеризации. Впервые такие графы были формально описаны в модели Уоттса–Строгаца [[3](#ref-watts-strogatz)]: если начать с регулярной решётки и случайно переподключить небольшую долю рёбер, получим граф с обоими свойствами.
+
+В NSW та же идея применена к задаче k-NN: вершины графа — векторы базы, каждая вершина соединена ребром с `M` своими ближайшими соседями (локальные рёбра, обеспечивающие кластеризацию) плюс с несколькими «далёкими» соседями, возникающими как случайный побочный эффект порядка вставок (длинные рёбра, обеспечивающие малый диаметр).
+
+### Жадный поиск
+
+Поиск в NSW — итеративный жадный спуск по графу:
+
+1. Стартовать из произвольной точки входа `ep`.
+2. Среди непосещённых соседей текущей вершины выбрать ближайшего к `q`.
+3. Если этот сосед ближе к `q`, чем текущая вершина, перейти в него. Иначе остановиться — текущая вершина является **локальным минимумом**.
+
+Проблема плоского NSW в том, что на большом `n` число шагов до окрестности ответа растёт слишком быстро: в начале поиска текущая вершина находится далеко от цели, и полезно было бы сразу «перепрыгнуть» на большое расстояние. Чтобы обеспечить такие прыжки на ранних шагах и точность на поздних, HNSW добавляет **иерархию**, идейно аналогичную skip-листу.
+
+## Иерархическая структура HNSW
+
+Вместо одного графа HNSW поддерживает **многослойный** граф:
+
+- слой `0` содержит все `n` вершин;
+- слой `l > 0` содержит подмножество вершин слоя `l − 1`;
+- ребра слоя `l` соединяют только те вершины, которые присутствуют на слое `l` и выше;
+- при движении вверх плотность вершин убывает экспоненциально: мощность слоя примерно `n · e^(-l / mL)`, где `mL = 1 / ln(M)`.
+
+Слой, на который попадает новая вершина, выбирается случайно по экспоненциальному распределению:
+
+```python
+def random_level(mL):
+    import math, random
+    # floor(-ln(U) · mL), где U ~ Uniform(0, 1)
+    return math.floor(-math.log(random.random()) * mL)
+```
+
+Параметры HNSW:
+
+| Параметр | Смысл | Типичное значение |
+|---|---|---|
+| `M` | Число соседей, выбираемых при вставке на каждом слое `l > 0` | 8–48 (чаще 16) |
+| `M_max` | Верхний предел числа соседей вершины на слое `l > 0` | `M` |
+| `M_max0` | Верхний предел числа соседей на слое 0 | `2 · M` |
+| `efConstruction` | Размер динамического списка кандидатов при построении | 64–800 |
+| `ef` | Размер динамического списка кандидатов при запросе | зависит от recall |
+| `mL` | Масштаб иерархии | `1 / ln(M)` |
+
+**Инвариант связности:** если вершина `v` присутствует на слое `l`, то все её рёбра на слое `l` ведут только к вершинам, которые также присутствуют на слое `l`.
+
+**Точка входа** (`enter point`) — единственная вершина, находящаяся на максимальном существующем уровне `L`. При вставке новой вершины `q` с уровнем `l > L` точка входа обновляется на `q`, и `L` увеличивается.
+
+### Схема иерархии
+
+<ReactECharts
+  style={{ height: 420 }}
+  option={{
+    title: { text: 'HNSW: 3-уровневый граф, красная стрелка — путь поиска', left: 'center', top: 0, textStyle: { fontSize: 13 } },
+    xAxis: { show: false, min: 0, max: 12 },
+    yAxis: { show: false, min: -0.5, max: 3 },
+    grid: { left: 30, right: 30, top: 40, bottom: 20 },
+    tooltip: { trigger: 'item' },
+    series: [
+      {
+        name: 'L0',
+        type: 'graph',
+        coordinateSystem: 'cartesian2d',
+        symbolSize: 14,
+        itemStyle: { color: '#91cc75' },
+        lineStyle: { color: '#9fbf88', width: 1, opacity: 0.7 },
+        label: { show: true, fontSize: 10, position: 'bottom', color: '#2a2a2a' },
+        data: [
+          { name: 'a', value: [1, 0] },
+          { name: 'b', value: [2, 0.2] },
+          { name: 'c', value: [3, 0] },
+          { name: 'd', value: [4, 0.2] },
+          { name: 'e', value: [5, 0] },
+          { name: 'f', value: [6, 0.2] },
+          { name: 'g', value: [7, 0] },
+          { name: 'h', value: [8, 0.2] },
+          { name: 'i', value: [9, 0] },
+          { name: 'j', value: [10, 0.2] },
+          { name: 'k', value: [11, 0] },
+          { name: 'ep0', value: [2, -0.2], itemStyle: { color: '#5470c6' } },
+        ],
+        links: [
+          { source: 'a', target: 'b' }, { source: 'b', target: 'c' }, { source: 'c', target: 'd' },
+          { source: 'd', target: 'e' }, { source: 'e', target: 'f' }, { source: 'f', target: 'g' },
+          { source: 'g', target: 'h' }, { source: 'h', target: 'i' }, { source: 'i', target: 'j' },
+          { source: 'j', target: 'k' }, { source: 'a', target: 'c' }, { source: 'd', target: 'f' },
+          { source: 'g', target: 'i' }, { source: 'ep0', target: 'a' }, { source: 'ep0', target: 'b' },
+        ],
+      },
+      {
+        name: 'L1',
+        type: 'graph',
+        coordinateSystem: 'cartesian2d',
+        symbolSize: 16,
+        itemStyle: { color: '#fac858' },
+        lineStyle: { color: '#d9a43a', width: 1.2, opacity: 0.8 },
+        label: { show: true, fontSize: 10, position: 'top', color: '#2a2a2a' },
+        data: [
+          { name: 'b₁', value: [2, 1.2] },
+          { name: 'e₁', value: [5, 1.2] },
+          { name: 'h₁', value: [8, 1.2] },
+          { name: 'j₁', value: [10, 1.2] },
+        ],
+        links: [
+          { source: 'b₁', target: 'e₁' },
+          { source: 'e₁', target: 'h₁' },
+          { source: 'h₁', target: 'j₁' },
+        ],
+      },
+      {
+        name: 'L2',
+        type: 'graph',
+        coordinateSystem: 'cartesian2d',
+        symbolSize: 18,
+        itemStyle: { color: '#ee6666' },
+        lineStyle: { color: '#c44', width: 1.5, opacity: 0.8 },
+        label: { show: true, fontSize: 11, position: 'top', color: '#2a2a2a', fontWeight: 'bold' },
+        data: [
+          { name: 'ep (L=2)', value: [3, 2.4], itemStyle: { color: '#ee6666', borderColor: '#333', borderWidth: 2 } },
+          { name: 'h₂', value: [8, 2.4] },
+        ],
+        links: [
+          { source: 'ep (L=2)', target: 'h₂' },
+        ],
+      },
+      {
+        name: 'path',
+        type: 'lines',
+        coordinateSystem: 'cartesian2d',
+        polyline: true,
+        effect: { show: false },
+        lineStyle: { color: '#d33', width: 2, type: 'dashed', opacity: 0.85 },
+        data: [
+          { coords: [[3, 2.4], [8, 2.4], [8, 1.2], [5, 1.2], [5, 0], [4, 0.2]] },
+        ],
+        zlevel: 2,
+      },
+    ],
+  }}
+/>
+
+Верхний слой `L2` содержит две вершины, `L1` — четыре, `L0` — все двенадцать. Красная штриховая стрелка показывает путь запроса `q`, целью которого является вершина `d`: спуск от точки входа через `L2 → L1 → L0` по жадному правилу.
+
+## Алгоритм поиска
+
+### SEARCH-LAYER
+
+`SEARCH-LAYER(q, ep, ef, lc)` — beam search в пределах одного слоя `lc`. Вход: запрос `q`, множество точек входа `ep`, размер луча `ef`. Выход: `ef` ближайших к `q` вершин, найденных на слое `lc`.
+
+Структуры данных:
+- `visited` — множество посещённых вершин (защита от повторного обхода);
+- `candidates` — min-куча по расстоянию до `q` (очередь фронтира);
+- `W` — max-куча по расстоянию до `q` размера ≤ `ef` (текущие лучшие найденные).
+
+Шаги:
+
+1. Инициализировать `visited = set(ep)`, `candidates = ep`, `W = ep`.
+2. Пока `candidates` не пуста:
+3. &nbsp;&nbsp;извлечь из `candidates` ближайшую к `q` вершину `c`;
+4. &nbsp;&nbsp;если `dist(c, q) > dist(furthest(W), q)`, прекратить — жадный поиск не улучшит `W`;
+5. &nbsp;&nbsp;для каждого соседа `e` вершины `c` на слое `lc`, не входящего в `visited`:
+6. &nbsp;&nbsp;&nbsp;&nbsp;добавить `e` в `visited`;
+7. &nbsp;&nbsp;&nbsp;&nbsp;если `|W| < ef` или `dist(e, q) < dist(furthest(W), q)`, то положить `e` в `candidates` и в `W`, а если `|W| > ef`, удалить из `W` самую дальнюю вершину.
+8. Вернуть `W`.
+
+```python
+def search_layer(q, ep, ef, lc, graph, dist):
+    visited = set(ep)                                # шаг 1
+    candidates = MinHeap((dist(e, q), e) for e in ep)
+    W = MaxHeap((dist(e, q), e) for e in ep)
+
+    while candidates:                                # шаг 2
+        d_c, c = candidates.pop_min()                # шаг 3
+        d_f, f = W.peek_max()
+        if d_c > d_f:                                # шаг 4
+            break
+        for e in graph.neighbors(c, lc):             # шаг 5
+            if e in visited:
+                continue
+            visited.add(e)                           # шаг 6
+            d_e = dist(e, q)
+            if d_e < d_f or len(W) < ef:             # шаг 7
+                candidates.push((d_e, e))
+                W.push((d_e, e))
+                if len(W) > ef:
+                    W.pop_max()
+                d_f, f = W.peek_max()
+    return W                                         # шаг 8
+```
+
+Условие в шаге 4 — ключевое свойство: при `ef = 1` алгоритм вырождается в чистый жадный спуск, при больших `ef` становится устойчивее к локальным минимумам (лучше recall, но дороже).
+
+### K-NN-SEARCH
+
+Поиск `K` ближайших соседей [[1](#ref-malkov-hnsw)]:
+
+1. Начать с единственной точки входа на максимальном уровне `L`.
+2. Для `lc = L, L-1, ..., 1` вызвать `SEARCH-LAYER(q, ep, ef=1, lc)` — это жадный спуск, быстро сходящийся к окрестности ответа;
+3. Взять результат последнего шага в качестве `ep` для слоя 0 и вызвать `SEARCH-LAYER(q, ep, ef, 0)` с большим `ef`;
+4. Вернуть `K` ближайших вершин из полученного множества.
+
+```python
+def knn_search(q, K, ef, index, dist):
+    ep = [index.enter_point]
+    for lc in range(index.L, 0, -1):                 # шаги 1–2
+        ep = search_layer(q, ep, ef=1, lc=lc,
+                          graph=index.graph, dist=dist)
+    W = search_layer(q, ep, ef=ef, lc=0,             # шаг 3
+                     graph=index.graph, dist=dist)
+    return sorted(W, key=lambda e: dist(e, q))[:K]   # шаг 4
+```
+
+### Числовой пример
+
+Пусть в 2D на слое 0 расположены вершины с координатами
+
+```
+a = (0, 0)   b = (1, 0)   c = (2, 0)   d = (3, 1)
+e = (4, 1)   f = (5, 2)   g = (6, 3)
+```
+
+и ребро `a–b–c–d–e–f–g` (цепочка плюс локальные рёбра `a–c`, `c–e`, `e–g`). Запрос `q = (3.2, 1.1)`. Метрика — евклидова (L2).
+
+Вычислим квадраты расстояний до `q = (3.2, 1.1)`:
+
+- `d^2(a, q) = 3.2^2 + 1.1^2 = 10.24 + 1.21 = 11.45`
+- `d^2(b, q) = 2.2^2 + 1.1^2 = 4.84 + 1.21 = 6.05`
+- `d^2(c, q) = 1.2^2 + 1.1^2 = 1.44 + 1.21 = 2.65`
+- `d^2(d, q) = 0.2^2 + 0.1^2 = 0.04 + 0.01 = 0.05`
+- `d^2(e, q) = 0.8^2 + 0.1^2 = 0.64 + 0.01 = 0.65`
+- `d^2(f, q) = 1.8^2 + 0.9^2 = 3.24 + 0.81 = 4.05`
+- `d^2(g, q) = 2.8^2 + 1.9^2 = 7.84 + 3.61 = 11.45`
+
+Жадный спуск при `ef = 1` со стартом из `a`:
+
+1. `a (11.45) → b (6.05)` — ближе, переходим.
+2. `b → c (2.65)` — ближе, переходим.
+3. `c → {b (6.05), d (0.05), e (0.65)}` — ближайший `d`, переходим.
+4. `d → {c (2.65), e (0.65)}` — ни один не ближе `d`. Остановка.
+
+Ответ `d` верен: `d^2(d, q) = 0.05` — минимум среди всех семи вершин.
+
+## Алгоритм вставки
+
+`INSERT(q, M, M_max, efConstruction, mL)` добавляет новую вершину `q` в индекс:
+
+1. Сэмплировать уровень `l = floor(-ln(U) · mL)` по экспоненциальному распределению.
+2. Для `lc = L, L-1, ..., l+1` выполнить `SEARCH-LAYER(q, ep, ef=1, lc)` — жадный спуск от точки входа до уровня, на котором вершина будет вставлена.
+3. Для `lc = min(L, l), ..., 0`:
+4. &nbsp;&nbsp;`W = SEARCH-LAYER(q, ep, ef=efConstruction, lc)` — подробный поиск кандидатов;
+5. &nbsp;&nbsp;`neighbors = SELECT-NEIGHBORS(q, W, M, lc)` — выбрать `M` соседей;
+6. &nbsp;&nbsp;добавить двунаправленные рёбра `q ↔ neighbors` на слое `lc`;
+7. &nbsp;&nbsp;для каждого `e` из `neighbors`: если степень `e` на слое `lc` превышает `M_max` (или `M_max0` для `lc = 0`), обрезать её, снова применив `SELECT-NEIGHBORS`;
+8. &nbsp;&nbsp;`ep = W`.
+9. Если `l > L`, обновить точку входа на `q` и `L = l`.
+
+### SELECT-NEIGHBORS
+
+В статье предложено два варианта отбора соседей [[1](#ref-malkov-hnsw)].
+
+**SELECT-NEIGHBORS-SIMPLE** — взять `M` ближайших к `q` из кандидатов `W`. Простая и быстрая эвристика, но склонная создавать плотные кластеры рёбер и плохо работает на неравномерных распределениях.
+
+**SELECT-NEIGHBORS-HEURISTIC** (алгоритм 4 оригинальной статьи) — предпочитает рёбра в «разных направлениях», что сохраняет навигационные свойства графа:
+
+```python
+def select_neighbors_heuristic(q, C, M, lc, graph, dist,
+                               extend_candidates=False,
+                               keep_pruned=True):
+    """
+    q — новая вершина;
+    C — множество кандидатов;
+    M — требуемое число соседей.
+    """
+    W = set(C)
+    if extend_candidates:
+        for e in C:
+            W.update(n for n in graph.neighbors(e, lc) if n not in W)
+
+    R = []                          # принятые соседи
+    W_d = []                        # «отложенные»
+    # Обрабатываем кандидатов в порядке возрастания dist(e, q)
+    for e in sorted(W, key=lambda x: dist(x, q)):
+        if len(R) >= M:
+            break
+        # Правило отсечения: принимаем e, только если он ближе к q,
+        # чем к любому уже принятому соседу.
+        if all(dist(e, q) < dist(e, r) for r in R):
+            R.append(e)
+        else:
+            W_d.append(e)
+
+    if keep_pruned:
+        for e in W_d:
+            if len(R) >= M:
+                break
+            R.append(e)
+    return R
+```
+
+Эвристика реализует **правило релятивных соседей** (relative neighborhood): новое ребро `q–e` принимается, если на отрезке от `q` до `e` нет уже выбранного соседа, «перегораживающего» направление. В многомерных пространствах это существенно уменьшает избыточность рёбер и увеличивает recall при том же `M`. На практике все современные реализации (hnswlib, FAISS, pgvector) используют именно эту эвристику.
+
+## Сложность
+
+| Операция | Ожидаемое время | Память |
+|---|---|---|
+| Поиск k-NN | `O(log n)` (эмпирически) | — |
+| Вставка | `O(log n)` на маршрут сверху + `O(M · efConstruction · log n)` на слой 0 | — |
+| Структура | — | `O(n · M)` |
+
+`O(log n)` для поиска — эмпирическое наблюдение, подтверждённое экспериментами в статье Малкова и Яшунина [[1](#ref-malkov-hnsw)], и теоретическая оценка в предположениях small-world графа и равномерно распределённых данных. Это **не** гарантия в худшем случае: неравномерные распределения, кластеры и сдвиги между обучающими и запросными данными могут привести к большему числу посещённых вершин. Аналогично [R-дереву](../spatial-indexes/r-tree.mdx), о жёсткой теоретической границе говорить не приходится.
+
+Для памяти: каждая вершина на слое 0 хранит до `M_max0 = 2M` указателей, вершины более высоких слоёв — до `M_max = M`. Ожидаемое число вершин на уровне `l` — `n · e^(-l / mL)`, а геометрическая сумма по уровням даёт константу, не зависящую от `n`. Итого в среднем `~ n · 2M` указателей графа плюс сами векторы `n · d · sizeof(float)`.
+
+## Компромиссы и настройка параметров
+
+### Recall–QPS кривая
+
+Центральный компромисс HNSW — **recall против пропускной способности** (QPS). При фиксированном индексе (`M`, `efConstruction`) изменение `ef` в момент запроса движет точку по кривой: больше `ef` → больше recall → меньше QPS.
+
+Ниже приведены данные из стандартного открытого бенчмарка ann-benchmarks [[4](#ref-ann-benchmarks)] для реализации hnswlib [[5](#ref-hnswlib)] на датасете `sift-128-euclidean` (1 млн векторов, `d = 128`, L2). Числа иллюстративны, точные значения зависят от конкретного запуска и оборудования.
+
+<ReactECharts
+  style={{ height: 380 }}
+  option={{
+    title: {
+      text: 'hnswlib, sift-128-euclidean: recall vs QPS (k = 10)',
+      left: 'center',
+      top: 0,
+      textStyle: { fontSize: 13 },
+    },
+    tooltip: {
+      trigger: 'item',
+      formatter: (p) => `ef=${p.data[2]}<br/>recall=${p.data[0].toFixed(3)}<br/>QPS=${p.data[1]}`,
+    },
+    xAxis: {
+      name: 'recall@10',
+      min: 0.85,
+      max: 1.0,
+      nameLocation: 'center',
+      nameGap: 28,
+      splitLine: { show: true, lineStyle: { type: 'dashed' } },
+    },
+    yAxis: {
+      name: 'QPS (single thread)',
+      type: 'log',
+      nameLocation: 'center',
+      nameGap: 40,
+      splitLine: { show: true, lineStyle: { type: 'dashed' } },
+    },
+    grid: { left: 70, right: 30, top: 40, bottom: 60 },
+    series: [
+      {
+        type: 'line',
+        symbol: 'circle',
+        symbolSize: 10,
+        itemStyle: { color: '#5470c6' },
+        lineStyle: { color: '#5470c6', width: 2 },
+        label: {
+          show: true,
+          formatter: (p) => `ef=${p.data[2]}`,
+          position: 'top',
+          fontSize: 10,
+        },
+        data: [
+          [0.900, 9500, 10],
+          [0.960, 6400, 20],
+          [0.985, 4000, 40],
+          [0.995, 2600, 80],
+          [0.999, 1500, 200],
+        ],
+      },
+    ],
+  }}
+/>
+
+Источник: ann-benchmarks.com, датасет `sift-128-euclidean`, алгоритм `hnswlib` (`M = 16`, `efConstruction = 500`); значения `ef` на кривой — 10, 20, 40, 80, 200. Конкретные QPS меняются от прогона к прогону; порядок величин соответствует открытым результатам на проекте [[4](#ref-ann-benchmarks)].
+
+### Выбор `M`
+
+- Маленькое `M` (4–8) — меньше памяти, быстрое построение, но recall плато ниже;
+- среднее `M` (16) — оптимально для большинства датасетов с `d ≤ 1000`;
+- большое `M` (32–48) — для плотных, «жёстких» распределений (высокая внутренняя размерность), но растёт память и время вставки.
+
+Память ребер: `n · 2M · 4 B` (при хранении id в int32). При `n = 10^6` и `M = 16` это ≈ 128 MB только на граф.
+
+### `efConstruction` vs `ef`
+
+Эти параметры независимы:
+- `efConstruction` фиксируется при построении индекса, влияет на его качество, но не на стоимость запроса;
+- `ef` можно менять без перестройки индекса, что удобно для онлайн-настройки компромисса recall/latency.
+
+Правило большого пальца: `efConstruction ≥ 2 · ef_target`, где `ef_target` — типичный `ef`, который планируется использовать в запросах.
+
+### Оценка памяти
+
+Для индекса на 10 млн векторов размерности 768 (float32, `M = 16`):
+
+- сами векторы: `10^7 · 768 · 4 B ≈ 30.7 GB`;
+- граф: `10^7 · 2 · 16 · 4 B ≈ 1.28 GB`;
+- итого ≈ **32 GB** на одну реплику. Это полностью укладывается в память одного современного сервера, но требует явного планирования.
+
+В пересчёте на одну точку: `≈ (768 · 4 + 2 · 16 · 4) B ≈ 3.2 KB` на вектор без квантизации.
+
+## Ограничения
+
+- **Нет эффективного удаления.** Физическое удаление разрушает инварианты графа. На практике используются **tombstones** (пометки на удаление) с периодическим перестроением индекса или обходом в момент запроса.
+- **Обновления** реализуются как delete + reinsert.
+- **Индекс в памяти.** HNSW плохо переносится на диск: случайные переходы по графу превращают каждый шаг поиска в случайное обращение к странице. Альтернатива для больших данных — **DiskANN / Vamana**, специально спроектированные под хранение графа на SSD.
+- **Чувствительность к распределению данных.** Сильно неравномерные, кластеризованные или смещённые (distribution shift между train и query) наборы снижают recall на хвостах.
+- **Холодный старт и детерминизм.** Из-за случайного выбора уровней два независимых построения индекса дают разные графы.
+
+## Применение в продакшене
+
+**Qdrant** — HNSW является основным и единственным графовым индексом. Параметры `m` (по умолчанию 16), `ef_construct` (по умолчанию 100), `ef` (по умолчанию равен `ef_construct` на запрос). Поддерживается фильтрованный поиск: фильтры применяются во время обхода графа, без отдельного пост-шага [[8](#ref-qdrant)].
+
+**Milvus** — HNSW поддерживается наравне с IVF-семейством (`IVF_FLAT`, `IVF_SQ8`, `IVF_PQ`) и on-disk индексом DiskANN. Выбор индекса и его параметров делается при создании коллекции [[9](#ref-milvus)].
+
+**Weaviate** — HNSW является индексом по умолчанию. Также поддерживаются `flat` и «динамический» индекс, автоматически переходящий от `flat` к HNSW при росте коллекции. Параметр `ef` можно сделать адаптивным: при `ef = -1` Weaviate вычисляет его на лету по формуле `ef = clamp(dynamicEfFactor · limit, dynamicEfMin, dynamicEfMax)` [[10](#ref-weaviate)].
+
+**pgvector** — начиная с версии 0.5.0 (август 2023) поддерживается HNSW. Синтаксис:
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_l2_ops)
+WITH (m = 16, ef_construction = 64);
+```
+
+Параметр `ef_search` задаётся как GUC на уровне сессии:
+
+```sql
+SET hnsw.ef_search = 100;
+```
+
+По умолчанию `m = 16`, `ef_construction = 64`, `hnsw.ef_search = 40` [[7](#ref-pgvector)].
+
+**Elasticsearch / OpenSearch** — HNSW реализован поверх Lucene: Lucene начиная с 9.x предоставляет `KnnFloatVectorQuery` и HNSW-кодек, а Elasticsearch ≥ 8.0 и OpenSearch ≥ 2.x используют его для поля `dense_vector` / `knn_vector`. Поддерживаются также квантизованные варианты (`int8_hnsw`, `int4_hnsw`, `bbq_hnsw`) [[11](#ref-lucene-knn)].
+
+**Redis (RediSearch)** — модуль RediSearch предоставляет векторный тип поля `VECTOR HNSW` с параметрами `M` (по умолчанию 16), `EF_CONSTRUCTION` (по умолчанию 200), `EF_RUNTIME` (по умолчанию 10) и `EPSILON` для range-запросов.
+
+**Vespa** — собственная реализация HNSW поверх тензорных полей `tensor<float>(x[d])`; параметры настраиваются в schema и поддерживают атрибутную фильтрацию.
+
+**FAISS** — библиотека от Meta предоставляет несколько вариантов: `IndexHNSWFlat` (без сжатия), `IndexHNSWSQ` (со скалярной квантизацией), `IndexHNSWPQ` (с product quantization), `IndexHNSW2Level` [[6](#ref-faiss)].
+
+## Список литературы
+
+1. <a id="ref-malkov-hnsw"></a> Malkov, Yu. A., & Yashunin, D. A. (2018). **Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs**. IEEE Transactions on Pattern Analysis and Machine Intelligence. Препринт 2016. [arXiv:1603.09320](https://arxiv.org/abs/1603.09320)
+
+2. <a id="ref-malkov-nsw"></a> Malkov, Y., Ponomarenko, A., Logvinov, A., & Krylov, V. (2014). **Approximate nearest neighbor algorithm based on navigable small world graphs**. Information Systems, 45, 61–68. [ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0306437913001300)
+
+3. <a id="ref-watts-strogatz"></a> Watts, D. J., & Strogatz, S. H. (1998). **Collective dynamics of 'small-world' networks**. Nature, 393(6684), 440–442. [nature.com](https://www.nature.com/articles/30918)
+
+4. <a id="ref-ann-benchmarks"></a> Aumüller, M., Bernhardsson, E., & Faithfull, A. **ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms**. [ann-benchmarks.com](https://ann-benchmarks.com/)
+
+5. <a id="ref-hnswlib"></a> Malkov, Y. et al. **hnswlib — header-only C++/python library for fast approximate nearest neighbors**. [github.com/nmslib/hnswlib](https://github.com/nmslib/hnswlib)
+
+6. <a id="ref-faiss"></a> Meta AI. **FAISS: A library for efficient similarity search. Faiss indexes wiki**. [github.com/facebookresearch/faiss/wiki/Faiss-indexes](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes)
+
+7. <a id="ref-pgvector"></a> Kane, A. **pgvector: Open-source vector similarity search for Postgres — HNSW**. [github.com/pgvector/pgvector](https://github.com/pgvector/pgvector#hnsw)
+
+8. <a id="ref-qdrant"></a> Qdrant. **Indexing — HNSW parameters**. [qdrant.tech/documentation/concepts/indexing](https://qdrant.tech/documentation/concepts/indexing/)
+
+9. <a id="ref-milvus"></a> Milvus. **In-memory index: HNSW, IVF, DiskANN**. [milvus.io/docs](https://milvus.io/docs)
+
+10. <a id="ref-weaviate"></a> Weaviate. **Vector index: HNSW, flat, dynamic; efDynamic parameters**. [docs.weaviate.io/weaviate/concepts/vector-index](https://docs.weaviate.io/weaviate/concepts/vector-index)
+
+11. <a id="ref-lucene-knn"></a> Apache Lucene. **KnnFloatVectorQuery — k-nearest neighbors search**. [lucene.apache.org](https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/search/KnnFloatVectorQuery.html)
