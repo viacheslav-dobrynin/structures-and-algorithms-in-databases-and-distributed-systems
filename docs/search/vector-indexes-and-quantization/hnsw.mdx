@@ -347,7 +347,7 @@ def select_neighbors_heuristic(q, C, M, lc, graph, dist,
 
 Центральный компромисс HNSW — **recall против пропускной способности** (QPS). При фиксированном индексе (`M`, `efConstruction`) изменение `ef` в момент запроса движет точку по кривой: больше `ef` → больше recall → меньше QPS.
 
-Ниже приведены данные из стандартного открытого бенчмарка ann-benchmarks [[4](#ref-ann-benchmarks)] для реализации hnswlib [[5](#ref-hnswlib)] на датасете `sift-128-euclidean` (1 млн векторов, `d = 128`, L2). Числа иллюстративны, точные значения зависят от конкретного запуска и оборудования.
+Ниже приведены числа **конкретного прогона** из тикета Apache Lucene `LUCENE-9937` [[12](#ref-lucene-9937)], где `hnswlib` [[5](#ref-hnswlib)] сравнивался с кандидатной Lucene-реализацией через ann-benchmarks [[4](#ref-ann-benchmarks)] на датасете `sift-128-euclidean` (1 млн векторов, `d = 128`, L2). Параметры индекса: `M = 16`, `efConstruction = 500`; запросы выполняются **последовательно в один поток**. Публичный лидерборд на ann-benchmarks.com [[4](#ref-ann-benchmarks)] показывает другие абсолютные значения QPS — там результаты собираются на ином оборудовании и в многопоточном режиме, — поэтому сравнивать значения лидерборда и таблицы ниже напрямую нельзя. Воспроизводится, однако, качественная форма кривой: рост `ef` повышает recall и снижает QPS.
 
 <ReactECharts
   style={{ height: 380 }}
@@ -364,7 +364,7 @@ def select_neighbors_heuristic(q, C, M, lc, graph, dist,
     },
     xAxis: {
       name: 'recall@10',
-      min: 0.85,
+      min: 0.7,
       max: 1.0,
       nameLocation: 'center',
       nameGap: 28,
@@ -373,11 +373,13 @@ def select_neighbors_heuristic(q, C, M, lc, graph, dist,
     yAxis: {
       name: 'QPS (single thread)',
       type: 'log',
+      min: 1000,
+      max: 100000,
       nameLocation: 'center',
-      nameGap: 40,
+      nameGap: 50,
       splitLine: { show: true, lineStyle: { type: 'dashed' } },
     },
-    grid: { left: 70, right: 30, top: 40, bottom: 60 },
+    grid: { left: 80, right: 30, top: 40, bottom: 60 },
     series: [
       {
         type: 'line',
@@ -392,18 +394,18 @@ def select_neighbors_heuristic(q, C, M, lc, graph, dist,
           fontSize: 10,
         },
         data: [
-          [0.900, 9500, 10],
-          [0.960, 6400, 20],
-          [0.985, 4000, 40],
-          [0.995, 2600, 80],
-          [0.999, 1500, 200],
+          [0.713, 69663, 10],
+          [0.950, 28022, 50],
+          [0.985, 16109, 100],
+          [1.000, 4116, 500],
+          [1.000, 2730, 800],
         ],
       },
     ],
   }}
 />
 
-Источник: ann-benchmarks.com, датасет `sift-128-euclidean`, алгоритм `hnswlib` (`M = 16`, `efConstruction = 500`); значения `ef` на кривой — 10, 20, 40, 80, 200. Конкретные QPS меняются от прогона к прогону; порядок величин соответствует открытым результатам на проекте [[4](#ref-ann-benchmarks)].
+Источник: тикет `LUCENE-9937` [[12](#ref-lucene-9937)], прогон ann-benchmarks на `sift-128-euclidean`; `hnswlib` с `M = 16`, `efConstruction = 500`, запросы — последовательно в один поток. Точные значения `(ef, recall, QPS)` из таблицы тикета: `(10, 0.713, 69663)`, `(50, 0.950, 28022)`, `(100, 0.985, 16109)`, `(500, 1.000, 4116)`, `(800, 1.000, 2730)`. Абсолютные значения QPS зависят от CPU, числа потоков и версий библиотек; воспроизводится только качественная форма (`ef ↑ ⇒ recall ↑, QPS ↓`).
 
 ### Выбор `M`
 
@@ -462,7 +464,7 @@ SET hnsw.ef_search = 100;
 
 По умолчанию `m = 16`, `ef_construction = 64`, `hnsw.ef_search = 40` [[7](#ref-pgvector)].
 
-**Elasticsearch / OpenSearch** — HNSW реализован поверх Lucene: Lucene начиная с 9.x предоставляет `KnnFloatVectorQuery` и HNSW-кодек, а Elasticsearch ≥ 8.0 и OpenSearch ≥ 2.x используют его для поля `dense_vector` / `knn_vector`. Поддерживаются также квантизованные варианты (`int8_hnsw`, `int4_hnsw`, `bbq_hnsw`) [[11](#ref-lucene-knn)].
+**Elasticsearch / OpenSearch** — HNSW реализован поверх Lucene: поддержка приближённого k-NN поиска по векторным полям (NSW-граф и `Lucene90` codec) появилась в Lucene 9.0, а класс `KnnFloatVectorQuery` и разделение float/byte-вариантов — в Lucene 9.5 [[11](#ref-lucene-knn)]. Elasticsearch ≥ 8.0 и OpenSearch ≥ 2.x используют этот кодек для полей `dense_vector` / `knn_vector` и предоставляют квантизованные варианты (`int8_hnsw`, `int4_hnsw`, `bbq_hnsw`).
 
 **Redis (RediSearch)** — модуль RediSearch предоставляет векторный тип поля `VECTOR HNSW` с параметрами `M` (по умолчанию 16), `EF_CONSTRUCTION` (по умолчанию 200), `EF_RUNTIME` (по умолчанию 10) и `EPSILON` для range-запросов.
 
@@ -488,8 +490,10 @@ SET hnsw.ef_search = 100;
 
 8. <a id="ref-qdrant"></a> Qdrant. **Indexing — HNSW parameters**. [qdrant.tech/documentation/concepts/indexing](https://qdrant.tech/documentation/concepts/indexing/)
 
-9. <a id="ref-milvus"></a> Milvus. **In-memory index: HNSW, IVF, DiskANN**. [milvus.io/docs](https://milvus.io/docs)
+9. <a id="ref-milvus"></a> Milvus (v2.6.x, 2025). **HNSW index — documentation**; **Index Explained — обзор типов индексов**. [milvus.io/docs/hnsw.md](https://milvus.io/docs/hnsw.md), [milvus.io/docs/index-explained.md](https://milvus.io/docs/index-explained.md). Исходник: [github.com/milvus-io/milvus-docs/blob/v2.6.x/site/en/userGuide/indexes/floating-vector/hnsw.md](https://github.com/milvus-io/milvus-docs/blob/v2.6.x/site/en/userGuide/indexes/floating-vector/hnsw.md).
 
 10. <a id="ref-weaviate"></a> Weaviate. **Vector index: HNSW, flat, dynamic; efDynamic parameters**. [docs.weaviate.io/weaviate/concepts/vector-index](https://docs.weaviate.io/weaviate/concepts/vector-index)
 
-11. <a id="ref-lucene-knn"></a> Apache Lucene. **KnnFloatVectorQuery — k-nearest neighbors search**. [lucene.apache.org](https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/search/KnnFloatVectorQuery.html)
+11. <a id="ref-lucene-knn"></a> Apache Lucene. **KnnFloatVectorQuery — k-nearest neighbors search**. [lucene.apache.org](https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/search/KnnFloatVectorQuery.html). См. также release notes 9.0 («Approximate nearest vector search via NSW graphs») и 9.5 (введение `KnnFloatVectorQuery` и `KnnFloatVectorField`).
+
+12. <a id="ref-lucene-9937"></a> Apache Lucene. **LUCENE-9937: Benchmark Lucene HNSW against hnswlib on sift-128-euclidean**. Таблица с результатами `hnswlib`: `(ef=10, recall=0.713, QPS=69663)`, `(ef=50, recall=0.950, QPS=28022)`, `(ef=100, recall=0.985, QPS=16109)`, `(ef=500, recall=1.000, QPS=4116)`, `(ef=800, recall=1.000, QPS=2730)`. [issues.apache.org/jira/browse/LUCENE-9937](https://issues.apache.org/jira/browse/LUCENE-9937)
