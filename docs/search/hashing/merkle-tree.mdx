@@ -184,7 +184,7 @@ def build_root(blocks):
 - **Bitcoin.** Если на каком-то уровне число узлов нечётно, последний узел **дублируется** и хешируется сам с собой [[5](#ref-nakamoto)]. Эта схема страдает от уязвимости **CVE-2012-2459** [[12](#ref-cve-2012-2459)]: злоумышленник может подобрать дублирующую транзакцию так, чтобы дерево с разным числом листьев давало один и тот же корень — вектор отказа в обслуживании. Эксплуатация была закрыта на уровне валидации Bitcoin Core, но дизайн-уязвимость в самой схеме осталась как поучительный пример.
 - **RFC 6962, §2.1** [[3](#ref-rfc-6962)]. Дерево разбивается асимметрично: `k` — наибольшая степень двойки, строго меньшая `n` (`k < n ≤ 2k`); левое поддерево содержит первые `k` листьев и полностью сбалансировано, правое — оставшиеся `n − k` и строится рекурсивно. Никакого дублирования. Форма дерева однозначно определяется числом `n`.
 
-Современные системы (Certificate Transparency, IPFS, etcd snapshot trees) используют RFC-6962-подобные правила. Дублирующее правило Bitcoin сохраняется только ради обратной совместимости с протоколом.
+Современные системы (Certificate Transparency, IPFS, Trillian — Google CT log) используют RFC-6962-подобные правила. Дублирующее правило Bitcoin сохраняется только ради обратной совместимости с протоколом.
 
 ### Обновление и append
 
@@ -197,7 +197,7 @@ def build_root(blocks):
 
 - **Second-preimage / domain confusion.** Если внутренние узлы и листья хешируются одной функцией без префикса, у атакующего появляется свобода: подменив сам блок данных хешем-конкатенацией двух листьев, он может построить «параллельное» поддерево с тем же корнем. RFC 6962 §2.1 [[3](#ref-rfc-6962)] предписывает обязательные префиксы `0x00` для листьев и `0x01` для внутренних узлов; это лечит уязвимость на уровне дизайна.
 - **CVE-2012-2459 (Bitcoin)** [[12](#ref-cve-2012-2459)]. Дублирование «лишнего» листа на нечётных уровнях позволяло разным наборам транзакций давать один и тот же merkle root — вектор block-malleability и DoS. Bitcoin Core закрыл уязвимость проверкой на уровне валидатора, но сам факт показывает, что split-rule из RFC 6962 строже и предпочтительнее.
-- **Слабая хеш-функция.** SHA-1 после атаки **SHAttered** (2017) [[14](#ref-shattered)] считается небезопасной для целей коллизионной стойкости — Git с тех пор переходит на SHA-256 (`extensions.objectFormat = sha256`). Для новых систем рекомендуются SHA-256, SHA-3 / Keccak-256 или BLAKE3. Постквантовая угроза — алгоритм Гровера снижает security level хеш-функции с `k` до `k/2` бит, что для SHA-256 даёт ~128-битную стойкость к коллизиям и считается достаточным запасом.
+- **Слабая хеш-функция.** SHA-1 после атаки **SHAttered** (2017) [[14](#ref-shattered)] считается небезопасной для целей коллизионной стойкости — Git с тех пор переходит на SHA-256 (`extensions.objectFormat = sha256`). Для новых систем рекомендуются SHA-256, SHA-3 / Keccak-256 или BLAKE3. Постквантовая угроза — алгоритм Гровера снижает preimage-стойкость с `k` до `k/2` бит, а алгоритм BHT (Brassard–Høyer–Tapp) [[16](#ref-bht)] — collision-стойкость с `k/2` до `k/3` бит. Для SHA-256 это ~128 бит preimage и ~85 бит collision; последнее всё ещё считается достаточным запасом для практических применений.
 - **Утечка структуры через timing.** В обычных реализациях верификации стороннего канала нет, но при работе с приватными данными (zk-proof'ы) важно проверять audit path в постоянное время.
 
 ## Сложность
@@ -286,7 +286,7 @@ def build_root(blocks):
 - `commit` — `tree` корневого снимка плюс ссылки на родительские коммиты, автор, сообщение;
 - `tag` — подписанная ссылка на конкретный коммит.
 
-Коммит фиксирует всё состояние репозитория одной строкой-хешем: изменение любого файла каскадирует вверх до commit hash. Исторически Git использовал SHA-1; с 2018 года ведётся миграция на SHA-256 (`git init --object-format=sha256`), мотивированная атакой SHAttered [[14](#ref-shattered)].
+Коммит фиксирует всё состояние репозитория одной строкой-хешем: изменение любого файла каскадирует вверх до commit hash. Исторически Git использовал SHA-1; с 2020 года Git поддерживает создание репозиториев на SHA-256 (`git init --object-format=sha256`, экспериментально с Git 2.29; стабильно с Git 2.42, август 2023), мотивированная атакой SHAttered (2017) [[14](#ref-shattered)].
 
 ### Bitcoin
 
@@ -335,7 +335,7 @@ IPFS строит файловую систему как **Merkle DAG** [[9](#re
 
 ### ZFS, Btrfs, dm-verity
 
-Файловые системы ZFS и Btrfs хранят хеши блоков в указателях родительских блоков, образуя дерево Меркла поверх структуры файла или метаданных — это даёт детектирование bit-rot при чтении (read-verify) и поддерживает целостный snapshot.
+ZFS хранит хеши (по умолчанию Fletcher4, опционально SHA-256) в указателях родительских блоков, образуя дерево Меркла, корнем которого является **uberblock**, — это даёт детектирование bit-rot при чтении (read-verify) и поддерживает целостный snapshot. Btrfs, напротив, хранит CRC32C (по умолчанию) или SHA-256/BLAKE2 (опционально, с kernel 5.5+) в отдельном **checksum tree** — это B-дерево, не дерево Меркла в классическом смысле, и CRC32C — не криптографический хеш.
 
 **dm-verity** в Linux (используется в Android verified boot, Chrome OS) располагает над read-only-разделом дерево Меркла поверх блоков фиксированного размера; ядро при чтении сверяет хеш блока со своим уровнем дерева вверх до подписанного root hash. Это обеспечивает целостность исполняемой системы при загрузке.
 
@@ -365,7 +365,7 @@ SMT используются в zk-rollup'ах (zkSync, Plasma Cash), систе
 
 **Verkle Tree** — современное развитие идеи Меркла, заменяющее хеш-функцию на **векторное полиномиальное обязательство** (vector commitment). Вместо хеширования двух дочерних хешей вычисляется коммитмент к вектору **многих** дочерних хешей; благодаря свойствам полиномиальных обязательств (KZG или IPA) можно построить **multi-proof**, доказывающий включение группы листьев почти за `O(1)` по числу листьев.
 
-Практический мотив для Ethereum — переход на **stateless-клиенты**: при ширине ветвления 256 размер witness падает с десятков мегабайт (при бинарном MPT с Keccak) до сотен килобайт. Ethereum Foundation описывает структуру в посте Ballet & Feist (2021) [[11](#ref-verkle-ef)]; академическое введение — Kuszmaul (2019) [[15](#ref-kuszmaul)]; внедрение запланировано как часть **Verge upgrade** через EIP-семейство 6800/4762 (на момент апреля 2026 — на тестнетах).
+Практический мотив для Ethereum — переход на **stateless-клиенты**: при ширине ветвления 256 размер witness падает с десятков мегабайт (при бинарном MPT с Keccak) до сотен килобайт. Ethereum Foundation описывает структуру в посте Ballet & Feist (2021) [[11](#ref-verkle-ef)]; академическое введение — Kuszmaul (2018) [[15](#ref-kuszmaul)]; внедрение запланировано как часть **Verge**-этапа roadmap'а Ethereum через EIP-семейство 6800/4762; конкретный hard-fork — **Hegota** (запланирован на 2H 2026), на тестнете **Verkle Gen Devnet 6**.
 
 ## Сравнение с альтернативами
 
@@ -405,8 +405,10 @@ SMT используются в zk-rollup'ах (zkSync, Plasma Cash), систе
 
 12. <a id="ref-cve-2012-2459"></a> NVD. **CVE-2012-2459 — Bitcoin Merkle tree duplicate transactions**. Уязвимость block-malleability при дублирующем правиле для нечётного числа листьев в Bitcoin Core до 0.4.6 / 0.5.5 / 0.6.0.7 / 0.6.2. [nvd.nist.gov/vuln/detail/CVE-2012-2459](https://nvd.nist.gov/vuln/detail/CVE-2012-2459)
 
-13. <a id="ref-cassandra-repair"></a> Apache Cassandra. **Repair (anti-entropy)**. Документация Apache Cassandra по операциям repair с использованием Merkle trees между репликами. [cassandra.apache.org/doc/latest/cassandra/operating/repair.html](https://cassandra.apache.org/doc/latest/cassandra/operating/repair.html)
+13. <a id="ref-cassandra-repair"></a> Apache Cassandra. **Repair (anti-entropy)**. Документация Apache Cassandra по операциям repair с использованием Merkle trees между репликами. [cassandra.apache.org/doc/latest/cassandra/managing/operating/repair.html](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/repair.html)
 
-14. <a id="ref-shattered"></a> Stevens, M., Bursztein, E., Karpman, P., Albertini, A., & Markov, Y. (2017). **The first collision for full SHA-1**. In *CRYPTO '17*. SHAttered: первая практическая коллизия SHA-1, мотивировавшая миграцию Git и многих других систем на SHA-256. [shattered.io](https://shattered.io/)
+14. <a id="ref-shattered"></a> Stevens, M., Bursztein, E., Karpman, P., Albertini, A., & Markov, Y. (2017). **The first collision for full SHA-1**. In *CRYPTO '17*. SHAttered: первая практическая коллизия SHA-1, мотивировавшая миграцию Git и многих других систем на SHA-256. IACR ePrint 2017/190. [eprint.iacr.org/2017/190](https://eprint.iacr.org/2017/190)
 
-15. <a id="ref-kuszmaul"></a> Kuszmaul, J. (2019). **Verkle Trees**. PRIMES paper, MIT. Академическое введение в идею векторных commitment-деревьев. [math.mit.edu/research/highschool/primes/materials/2018/Kuszmaul.pdf](https://math.mit.edu/research/highschool/primes/materials/2018/Kuszmaul.pdf)
+15. <a id="ref-kuszmaul"></a> Kuszmaul, J. (2018). **Verkle Trees**. PRIMES paper, MIT (представлен на PRIMES Conference 2019). Академическое введение в идею векторных commitment-деревьев. [math.mit.edu/research/highschool/primes/materials/2018/Kuszmaul.pdf](https://math.mit.edu/research/highschool/primes/materials/2018/Kuszmaul.pdf)
+
+16. <a id="ref-bht"></a> Brassard, G., Høyer, P., & Tapp, A. (1997). **Quantum cryptanalysis of hash and claw-free functions**. arXiv:quant-ph/9705002. Алгоритм BHT даёт квантовую границу `2^(n/3)` для коллизионной стойкости n-битного хеша. [arxiv.org/abs/quant-ph/9705002](https://arxiv.org/abs/quant-ph/9705002)
