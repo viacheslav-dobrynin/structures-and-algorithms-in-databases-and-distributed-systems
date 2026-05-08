@@ -1,0 +1,329 @@
+---
+title: Lock-free и wait-free структуры данных
+sidebar_position: 1
+---
+
+import ReactECharts from 'echarts-for-react';
+
+# Lock-free и wait-free структуры данных
+
+## Мотивация
+
+Классический способ обеспечить корректный доступ к разделяемой структуре данных из нескольких потоков — взять мьютекс. Семантика проста, доказательства линеаризуемости тривиальны, но платой служит **блокирующее поведение**: если поток-владелец захвачен прерыванием, page fault'ом, GC-паузой или просто вытеснен планировщиком, все остальные потоки, ждущие тот же замок, тоже встают. На практике это даёт три знакомых патологии:
+
+- **Lock convoy.** Поток отпускает мьютекс, его сразу подбирает другой; первый, проснувшись, встаёт в конец очереди. Под высокой нагрузкой пропускная способность падает в разы.
+- **Priority inversion.** Низкоприоритетный поток держит замок, нужный высокоприоритетному; среднеприоритетный поток вытесняет низкоприоритетный, и высокоприоритетный ждёт неограниченно долго. Канонический пример — Mars Pathfinder (1997): мьютекс bus management в VxWorks был создан без флага priority inheritance, что приводило к watchdog-перезагрузкам марсохода [[18](#ref-pathfinder)].
+- **Stop-the-world эффекты.** Любая задержка владельца замка масштабируется на всех ждущих; в распределённых и real-time системах это недопустимо.
+
+В системных и СУБД-движках та же проблема возникает повсеместно. PostgreSQL имеет десятки **LWLock** для разделяемой памяти (буферный пул, WAL-инсерт, ProcArray); под нагрузкой `WALInsertLock` исторически становится горлышком и потребовал шардирования на 8 «слотов» [[19](#ref-postgres-lwlock)]. InnoDB использует latch'и на B-tree-страницы (latch coupling) — именно их избегает **Bw-tree** [[7](#ref-bw-tree)], хранящий состояние страниц как цепочку delta-записей и переключающий версии одним CAS. MVCC-движки (Postgres, Oracle) держат версионные цепочки и атомарно переключают snapshot-указатели, не блокируя читателей. Linux-ядро использует **RCU** в dcache, ip-routing и BPF-картах, где счёт читателей идёт на миллионы операций в секунду [[14](#ref-rcu-doc)].
+
+**Lock-free** и **wait-free** структуры данных — это семейство алгоритмов, в которых блокирующий примитив (`mutex`, `latch`, спин-лок) заменён на атомарные read-modify-write-операции (`CAS`, `FAA`, `LL/SC`) с явной моделью памяти. Они дают **прогресс системы при любой задержке отдельного потока**: убитый, вытесненный или приостановленный поток не мешает остальным. Эта статья — о том, какие именно гарантии прогресса бывают, какие конструкции их реализуют, и где они применяются в БД и распределённых системах.
+
+## Условия прогресса
+
+Иерархию **условий прогресса** для конкурентных объектов формализовали Herlihy и Shavit [[1](#ref-herlihy-shavit)]. От слабых к сильным:
+
+- **Blocking (mutex / spin-lock).** Прогресс отдельного потока зависит от других: владелец замка может задержаться сколь угодно долго, и все ожидающие встают.
+- **Obstruction-free.** Любой поток, выполняющийся в одиночку (без конкуренции от других), завершит операцию за конечное число шагов. Допускает **live-lock**: два потока могут бесконечно мешать друг другу.
+- **Lock-free.** Если несколько потоков параллельно выполняют операции на структуре, **хотя бы один** завершит свою операцию за конечное число шагов. Никакая задержка отдельного потока не блокирует систему в целом, но конкретный поток может быть бесконечно «обделён» (starvation).
+- **Wait-free.** **Каждый** поток завершает свою операцию за **ограниченное** число своих собственных шагов, независимо от поведения других. Сильнейшая гарантия; обязательна для жёсткого real-time.
+
+Свойства **monotonic strict total order**: wait-free ⟹ lock-free ⟹ obstruction-free. Lock-free структура автоматически obstruction-free, но не наоборот.
+
+| Условие прогресса | Гарантия | Цена в коде | Канонические примеры |
+|---|---|---|---|
+| Blocking | Прогресс зависит от планировщика | один CAS на захват + ожидание | `synchronized`, `pthread_mutex`, `LWLock`, latch |
+| Obstruction-free | Только в одиночку | RMW + retry, без helping | DSTM (Herlihy 2003) |
+| Lock-free | Хоть кто-то прогрессирует всегда | RMW-цикл, ABA-защита, безопасное освобождение | Treiber stack, Michael–Scott queue, Harris list |
+| Wait-free | Каждый прогрессирует за O(1) шагов | помощь чужим операциям, FAA-индексы, announce-tables | Kogan–Petrank queue (PPoPP 2011) [[16](#ref-kogan-petrank)] |
+
+В практическом языке слово «lock-free» употребляется неточно: им называют любую неблокирующую конструкцию. Например, `java.util.concurrent.ConcurrentLinkedQueue` — **lock-free, но не wait-free**: javadoc явно говорит, что это вариант алгоритма Майкла–Скотта PODC 1996, в котором поток-неудачник в гонке за `tail` повторяет CAS-цикл [[12](#ref-clq-source)]. Wait-free-варианты той же задачи существуют (Kogan–Petrank, PPoPP 2011 [[16](#ref-kogan-petrank)]), но они дороже на низком контеншене и редко используются вне real-time-сред.
+
+## Атомарные примитивы и память
+
+### CAS, FAA, LL/SC
+
+**Compare-and-swap (CAS)** — универсальный примитив; принимает адрес `addr`, ожидаемое значение `expected` и новое значение `new`. Атомарно проверяет `*addr == expected`; если да — пишет `new`, возвращает успех. На x86-64 кодируется как `LOCK CMPXCHG`; на ARMv8.1+ — единственная инструкция `CAS` / `CASA` / `CASL` / `CASAL` (с разными вариантами acquire/release-семантики), часть расширения **LSE (Large System Extensions)** [[10](#ref-arm-lse)]. На более старом AArch64 (до 8.1) и ARMv7 CAS реализуется парой `LDXR` / `STXR` (или `LDREX` / `STREX`), то есть **load-linked / store-conditional (LL/SC)** [[10](#ref-arm-lse)].
+
+**LL/SC** — альтернативная пара примитивов, исторически на DEC Alpha, MIPS, PowerPC, ARM. `LL(addr)` помечает `addr` для слежения; `SC(addr, val)` пишет, только если адрес не модифицировался между `LL` и `SC`. Преимущество перед CAS — естественная защита от ABA на уровне аппаратного reservation set'а; недостаток — эффект false-sharing (любая запись в кэш-линию срывает SC).
+
+**Fetch-and-add (FAA)** — атомарное `*addr += delta` с возвратом старого значения; на x86 — `LOCK XADD`. Дешевле CAS-цикла на сильно конкурентных счётчиках: каждая операция гарантированно прогрессирует за один шаг (FAA — wait-free по определению).
+
+### Модель памяти
+
+Современные CPU и компиляторы переупорядочивают чтения/записи; чтобы CAS-алгоритмы были корректны, нужно явно навязать **порядок** между обычными доступами и атомарной операцией. Минимальный язык:
+
+- `relaxed` — атомарность без ограничений на порядок относительно других доступов;
+- `acquire` — обычные доступы **после** этой операции не уезжают **перед** ней;
+- `release` — обычные доступы **до** этой операции не уезжают **после** неё;
+- `acq-rel` / `seq-cst` — оба ограничения сразу; `seq_cst` плюс глобальный полный порядок.
+
+В Java — `volatile`-чтения и `volatile`-записи, операции `VarHandle.compareAndSet` с явным режимом, и **JEP 188 / JSR-133** определяют корректную модель памяти JVM, обновлённую в Java 5 и уточнённую в Java 9 [[11](#ref-jep-188)] [[17](#ref-jsr-133)]. В C++11 — `std::memory_order` поверх `std::atomic`. Без этих ограничений компилятор имеет право, например, переставить инициализацию узла **после** CAS, добавляющего его в список — другой поток увидит мусор.
+
+### Псевдокод: атомарный счётчик через CAS
+
+```cpp
+std::atomic<uint64_t> counter{0};
+
+void increment() {
+    uint64_t cur = counter.load(std::memory_order_relaxed);
+    while (!counter.compare_exchange_weak(
+            cur, cur + 1,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+        // cur уже обновлён; повторяем
+    }
+}
+```
+
+Альтернатива через FAA — одна инструкция и без цикла, поэтому **wait-free**:
+
+```cpp
+counter.fetch_add(1, std::memory_order_acq_rel);
+```
+
+### Псевдокод: Treiber push
+
+```cpp
+struct Node { T value; Node* next; };
+std::atomic<Node*> top{nullptr};
+
+void push(T v) {
+    Node* n = new Node{std::move(v), nullptr};
+    Node* old = top.load(std::memory_order_relaxed);
+    do {
+        n->next = old;                                  // (1) подвязываем под текущую вершину
+    } while (!top.compare_exchange_weak(                // (2) пытаемся встать вершиной
+            old, n,
+            std::memory_order_release,
+            std::memory_order_relaxed));
+}
+```
+
+`release` на CAS гарантирует, что инициализация поля `value` (происходящая до строки 1) видна потоку, который позже сделает `pop` с `acquire` — это и есть **publish-pattern**, лежащий в основе всех lock-free-структур.
+
+### Проблема ABA
+
+Сценарий: поток `T1` читает `top = A`, готовит CAS `A → C` и засыпает. Пока он спит, поток `T2` делает `pop(A)`, `pop(B)`, `push(A)` — поле `top` снова содержит `A`, но это **другая жизнь** того же узла. CAS у `T1` проходит, но `next` указывает на освобождённый узел `B`. Структура повреждена.
+
+Способы защиты:
+
+- **Tagged-pointer / counted-pointer.** Хранить пару `(ptr, tag)` атомарно; tag растёт на каждом CAS. На x86-64 — 16-байтная пара через `CMPXCHG16B` (DCAS на одном слове 128 бит).
+- **Hazard pointers** (Michael 2004) [[3](#ref-hazard-pointers)] — явный реестр «я сейчас читаю X»; reclaimer не освобождает X, пока кто-то его помечает.
+- **Epoch-based reclamation (EBR)** — Fraser 2004 [[5](#ref-fraser)] — потоки помечают эпоху на входе в критическую секцию; reclaimer освобождает узел, ушедший в две эпохи назад.
+- **RCU (Read-Copy-Update)** — близкий по идее механизм в ядре Linux: писатели делают копию + atomic swap + grace period; читатели вообще без синхронизации [[14](#ref-rcu-doc)].
+- **GC.** В Java и Go ABA на уровне «узел переиспользован» невозможен в принципе — освобождённый узел не может быть повторно адресован, пока есть хотя бы одна ссылка [[12](#ref-clq-source)]. Поэтому JDK-реализация Майкла–Скотта обходится без счётчика версии.
+
+## Lock-free структуры данных: каноничные конструкции
+
+### Treiber stack (1986)
+
+R. Kent Treiber, IBM Research Report **RJ 5118**, апрель 1986 [[2](#ref-treiber)]. Односвязный список, единственное общее поле — указатель на вершину; `push` и `pop` строятся на одном CAS (см. псевдокод выше). Идея, инвариант и стоимость:
+
+- **Идея:** вершина стека — единственная разделяемая ссылка; модификация — атомарный CAS этой ссылки.
+- **Инвариант:** список достижим из `top`, каждое ребро `next` неизменно после публикации.
+- **Стоимость:** `O(1)` на операцию в отсутствие конкуренции; под высоким контеншеном — серия CAS-промахов; latency деградирует линейно по числу потоков, throughput выходит на плато (см. раздел «Визуализация»).
+- **Production user:** свободный список узлов в стандартной библиотеке Java (`AbstractQueuedSynchronizer` использует Treiber-подобный CAS-стек ожидающих узлов).
+
+### Michael–Scott queue (PODC 1996)
+
+Maged M. Michael, Michael L. Scott. *Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms*, PODC '96 [[4](#ref-michael-scott)]. Односвязный список с двумя указателями (`Head`, `Tail`) и **dummy-узлом** в начале:
+
+```
+enqueue(q, v):
+    new_node = Node(v, NULL)
+    loop:
+        tail = q.Tail
+        next = tail.next
+        if tail == q.Tail:                              # snapshot ещё валиден
+            if next == NULL:                            # tail указывает на последний
+                if CAS(&tail.next, NULL, new_node):     # подвязали узел
+                    CAS(&q.Tail, tail, new_node)        # «помогли» сдвинуть Tail
+                    return
+            else:                                       # Tail отстаёт — помогаем
+                CAS(&q.Tail, tail, next)
+```
+
+`dequeue` симметричен: CAS `Head ← head.next`, dummy-узел даёт chain'у не отвалиться при пустой очереди. Алгоритм linearizable, lock-free, требует ABA-защиты в не-GC-средах.
+
+**Production user:** OpenJDK `java.util.concurrent.ConcurrentLinkedQueue` — прямой потомок этого алгоритма. Внутрикодовый комментарий явно ссылается на Michael & Scott PODC 1996 и поясняет, что в GC-среде счётчики версии не нужны — JVM не позволит переиспользовать узел, пока на него есть ссылка [[12](#ref-clq-source)].
+
+### Harris linked list (DISC 2001) и расширение Майкла (SPAA 2002)
+
+Timothy L. Harris. *A Pragmatic Implementation of Non-Blocking Linked-Lists*, DISC '01, LNCS 2180 [[6](#ref-harris)]. Главная идея — **двухшаговое удаление** через бит-маркер (logical delete + physical unlink):
+
+1. CAS меняет `next.marked` с `false` на `true` — узел логически удалён, но ещё в списке.
+2. CAS у предыдущего узла перебрасывает `prev.next` через помеченный узел — физическое удаление.
+
+Между шагами другой поток может «помочь» удалить помеченный узел; гарантируется linearizability в точке (1). Maged Michael (SPAA 2002) расширил конструкцию для **lock-free hash table chains** на тех же принципах, добавив hazard pointers для безопасного освобождения отсоединённых узлов [[9](#ref-michael-spaa)].
+
+### Lock-free хеш-таблицы
+
+Два классических подхода:
+
+- **Закрытое хеширование с lock-free chains** (Michael, SPAA 2002): каждый bucket — Harris-список, `find/insert/delete` через двухшаговое удаление. Расширение (resize) дороже — обычно блокирующее или incremental.
+- **Split-ordered lists** (Shalev & Shavit, JACM 53(3), 2006) [[8](#ref-shalev-shavit)]: единый отсортированный связный список; bucket-указатели вставляют sentinel-узлы. Resize — это просто увеличение числа bucket'ов и **никакого** перепланирования цепочек: split-ordering гарантирует, что новые bucket'ы проходят в правильное место списка. `O(1)` ожидаемая стоимость операции, lock-free вставки/удаления через Harris-маркеры.
+
+Cliff Click опубликовал (2007) NonBlockingHashMap для Java на принципах **FSM-state-машины** ячейки; алгоритм быстрый практически, но в литературе линеаризуемость и lock-free-свойства остаются предметом дискуссии — формальных доказательств нет, рекомендуется использовать с осторожностью.
+
+### Lock-free skip list
+
+Keir Fraser, *Practical Lock-Freedom*, Cambridge UCAM-CL-TR-579 (2004) [[5](#ref-fraser)]; Fraser & Harris (2007). Каждый уровень skip-list'а — Harris-список с маркером удаления; вставка идёт снизу вверх через серию CAS, удаление — пометка на каждом уровне + физический unlink. `O(log n)` ожидаемая стоимость, никаких глобальных замков.
+
+**Production user:** OpenJDK `java.util.concurrent.ConcurrentSkipListMap` — концурентный навигируемый map на skip-list'е. javadoc прямо указывает, что реализация Doug Lea основана на работах Fraser и Harris [[13](#ref-cslm-javadoc)].
+
+### Bw-tree (ICDE 2013)
+
+Justin J. Levandoski, David B. Lomet, Sudipta Sengupta. *The Bw-Tree: A B-tree for New Hardware Platforms*, ICDE 2013 [[7](#ref-bw-tree)]. **Latch-free** B-tree, оптимизированный под кеши многоядерных CPU и flash-хранилища:
+
+- Каждая страница идентифицируется не указателем, а **PID** в **mapping table**.
+- Изменения страницы прикладываются как **delta-records**, prepended к цепочке.
+- Атомарная установка нового заголовка цепочки — единственный CAS на mapping table.
+- Splits, merges, page consolidations выполняются лениво; конкурирующие потоки помогают друг другу через стандартный helping-pattern.
+
+**Production user:** SQL Server Hekaton, Azure Cosmos DB / DocumentDB, Bing's index storage — продукты Microsoft; open-source-имплементации существуют (CMU's BwTree, Peloton). Каноническая ссылка на ICDE 2013 — paper и его расширенная VLDB-версия 2013.
+
+## Безопасное освобождение памяти
+
+В средах без GC удаление узла из lock-free-структуры порождает классический gap: узел отсоединён, но **другие потоки могут держать на него ссылку**. Преждевременное освобождение → use-after-free и ABA. Три массовых решения:
+
+| Механизм | Идея | Стоимость на reader | Стоимость на reclamation | Production |
+|---|---|---|---|---|
+| **Hazard Pointers** [[3](#ref-hazard-pointers)] | Каждый поток публикует ≤K «защищённых» указателей; reclaimer проверяет реестр | один atomic-store + memory fence на доступ | сканирование реестра потоков, `O(N·K)` | C++ Folly, ConcurrencyFreaks, проект C++26 `std::hazard_pointer` |
+| **EBR** (epoch-based) [[5](#ref-fraser)] | Глобальная эпоха; поток на входе помечает «я в эпохе E»; reclaimer ждёт, пока все ушли вперёд | один atomic-store на критическую секцию | дешевле HP при множестве защищаемых ссылок | Rust crate `crossbeam-epoch`, ядро NetBSD (`vmem`) |
+| **RCU** (read-copy-update) [[14](#ref-rcu-doc)] | Писатель публикует копию атомарным swap'ом; читатели идут совершенно без синхронизации; reclaimer ждёт grace period (все потоки прошли quiescent state) | **ноль** (только зависимостный read) | grace-period detection: tick-based в ядре | Linux kernel: dcache, IP routing, BPF maps; userspace-RCU (liburcu) |
+
+Hazard pointers и EBR применимы из user-space; RCU исторически — kernel-механизм, но liburcu даёт userspace-вариант. Выбор: **RCU**, если читатели — горячий путь и обновлений мало; **HP**, если число защищаемых указателей на поток ограничено константой; **EBR**, если потоков много и важна простота.
+
+## Применения в БД и распределённых системах
+
+- **Bw-tree → SQL Server Hekaton.** Latch-free B-tree, описанный в ICDE 2013 [[7](#ref-bw-tree)], работает в production-движке in-memory OLTP Microsoft SQL Server, в Azure Cosmos DB и Bing.
+- **MVCC snapshot pointers.** В PostgreSQL и Oracle переход к новой версии строки — атомарная установка указателя в её tuple-header. Читатели с активным snapshot'ом видят старую версию без всякой блокировки; vacuum / undo-механизм играет роль reclamation'а с условиями, аналогичными EBR (нет активных читателей старше определённого xmin).
+- **Lock-free WAL append / log queues.** В PostgreSQL `WALInsertLock` исторически был bottleneck'ом и начиная с 9.4 шардирован на 8 слотов с lock-free reservation позиции через FAA [[19](#ref-postgres-lwlock)]. **LMAX Disruptor** [[15](#ref-disruptor)] — кольцевой буфер с FAA-резервацией позиций; сами авторы аккуратно отмечают, что Disruptor **lock-free**, но **не wait-free**: при коллизии producer'ы могут выполнять несколько CAS, и формально один из них может бесконечно проигрывать.
+- **RCU в ядре Linux.** dcache (path lookup), маршрутизация (FIB), BPF-карты — read-side вообще без атомарных операций; обновление через copy + swap + synchronize_rcu. Документация ядра `Documentation/RCU/whatisRCU.rst` [[14](#ref-rcu-doc)].
+- **Lock-free buffer pools.** Современные in-memory СУБД и cache-layer (LeanStore, Umbra) применяют CLOCK-replacement с атомарным reference-bit и lock-free-захватом frame'ов через CAS на состоянии страницы.
+
+См. также параллельные конструкции в Java: [Concurrent Hash Map](../java/concurrent-hash-map.md) и [иммутабельные / persistent структуры](../immutable/immutable-vs-persistent.md), где блокировка избегается принципиально иначе — через структурное разделение ссылок.
+
+## Визуализация: пропускная способность под контеншеном
+
+Канонический эксперимент — **продьюсер-консьюмер на стеке**. Hendler, Shavit и Yerushalmi (SPAA 2004) [[20](#ref-hendler-shavit)] измерили пропускную способность четырёх реализаций на 14-узловом Sun Enterprise E6500 (UltraSPARC, Solaris 9), workload — 50% push / 50% pop, 500 000 операций на поток. Числа на графике ниже — операций в секунду, считаны с Figure 7 указанной работы:
+
+- **Treiber stack (без backoff)** — чистый CAS-цикл, при росте контеншена пропускная способность падает в разы (cache-line ping-pong на `top`).
+- **Treiber stack + exponential backoff** — тот же CAS-цикл, но при промахе CAS поток ждёт растущий промежуток времени; throughput держится почти на уровне одного потока.
+- **MCS lock + serial stack** — лок-стек на MCS-локе [[21](#ref-mcs)] для контраста; работает стабильно, но не масштабируется по числу потоков (последовательное горлышко).
+
+<ReactECharts
+  style={{ height: 380 }}
+  option={{
+    title: {
+      text: 'Пропускная способность стека под контеншеном (Hendler, Shavit, Yerushalmi, SPAA 2004, Figure 7)',
+      left: 'center',
+      textStyle: { fontSize: 13 },
+    },
+    tooltip: { trigger: 'axis' },
+    legend: { bottom: 0, data: ['Treiber (без backoff)', 'Treiber + exp. backoff', 'MCS lock + serial stack'] },
+    grid: { left: 70, right: 30, top: 50, bottom: 60 },
+    xAxis: {
+      type: 'log',
+      logBase: 2,
+      name: 'число потоков',
+      nameLocation: 'middle',
+      nameGap: 28,
+      min: 1,
+      max: 32,
+    },
+    yAxis: {
+      type: 'value',
+      name: 'операций / сек',
+      nameLocation: 'middle',
+      nameGap: 55,
+      min: 0,
+      max: 4000,
+    },
+    series: [
+      {
+        name: 'Treiber (без backoff)',
+        type: 'line',
+        symbolSize: 8,
+        data: [[1, 2700], [2, 700], [4, 400], [8, 300], [14, 250], [32, 200]],
+      },
+      {
+        name: 'Treiber + exp. backoff',
+        type: 'line',
+        symbolSize: 8,
+        data: [[1, 2700], [2, 2700], [4, 3000], [8, 3000], [14, 3000], [32, 3000]],
+      },
+      {
+        name: 'MCS lock + serial stack',
+        type: 'line',
+        symbolSize: 8,
+        lineStyle: { type: 'dashed' },
+        data: [[1, 2500], [2, 2200], [4, 2200], [8, 2200], [14, 2200], [32, 2200]],
+      },
+    ],
+  }}
+/>
+
+Главный вывод: **lock-free сам по себе не даёт масштабируемости** — Treiber без backoff проигрывает MCS-локу уже при четырёх потоках. Хорошее масштабирование возникает только при добавлении дисциплины разрешения конфликтов: backoff (как у Treiber + backoff) или элиминации (Hendler–Shavit–Yerushalmi показывают, что elimination-backoff stack достигает ~7500 ops/сек при 32 потоках на тех же измерениях). Урок: «lock-free» — это про прогресс, а не про скорость.
+
+## Сравнение с альтернативами
+
+| Подход | Read | Write | Поведение под отказом потока | Освобождение памяти | Когда выбирать |
+|---|---|---|---|---|---|
+| Coarse mutex | блокирующий | блокирующий | вся структура встаёт | тривиальное (сборщик) | малая нагрузка, простой код |
+| Fine-grained locking (latch coupling, hand-over-hand) | блокирующий | блокирующий | блокировка локализована | тривиальное | классические B-trees, читателей мало |
+| Lock-free | неблокирующий, ≥1 CAS | неблокирующий, CAS-цикл | прогресс системы сохраняется | HP / EBR / GC | высокий контеншен, масштабируемость, нет real-time-требований |
+| Wait-free | гарантированно за `O(1)` шагов | гарантированно за `O(1)` шагов | прогресс **каждого** потока | HP / EBR / GC | hard real-time, медицинская / авиа-электроника |
+| RCU | **бесплатный** (ноль atomic) | копия + swap + grace period | читатели не страдают; писатель один | grace-period detection | read-mostly: routing-tables, dcache |
+
+## Подводные камни и анти-паттерны
+
+- **«Lock-free всегда быстрее»** — миф. Herlihy & Shavit [[1](#ref-herlihy-shavit)] и эксперименты SPAA 2004 [[20](#ref-hendler-shavit)] прямо показывают: при высоком контеншене чистый CAS-цикл проигрывает MCS-локу. Lock-free — про прогресс при отказах, а не про absolute throughput.
+- **Live-lock без helping.** Если поток откатывает свой CAS и сразу повторяет, а второй поток делает то же — оба бесконечно мешают друг другу. Решения: exponential backoff (Treiber), elimination (Hendler), helping (Michael–Scott, Kogan–Petrank).
+- **ABA без HP / EBR / tag.** В не-GC-среде узел переиспользуется → CAS на старом адресе проходит ошибочно. Любая lock-free-конструкция в C/C++/Rust обязана выбрать механизм reclamation **до** написания первой строки.
+- **Verification.** Доказывать корректность lock-free вручную опасно. Промышленные инструменты: модельные чекеры **SPIN** (LTL-свойства), **CDSChecker** (Norris–Demsky 2013, exhaustive interleavings под C11 memory model), **GenMC** (Kokologiannakis et al.), стресс-фреймворки **jcstress** (OpenJDK) — обязательны для всякой реализации, претендующей на production.
+
+## Список литературы
+
+1. <a id="ref-herlihy-shavit"></a> Herlihy, M., Shavit, N., Luchangco, V., & Spear, M. (2020). **The Art of Multiprocessor Programming**, 2nd ed. Morgan Kaufmann. Канонический учебник; главы 3–4 формализуют иерархию obstruction-free / lock-free / wait-free, главы 9–14 разбирают каноничные конструкции. [shop.elsevier.com/books/the-art-of-multiprocessor-programming/herlihy/978-0-12-415950-1](https://shop.elsevier.com/books/the-art-of-multiprocessor-programming/herlihy/978-0-12-415950-1)
+
+2. <a id="ref-treiber"></a> Treiber, R. K. (1986). **Systems Programming: Coping with Parallelism**. IBM Almaden Research Center, Research Report **RJ 5118**, April 1986. Первое описание lock-free LIFO-стека (CAS на `top`-указателе) и lock-free-фрилиста. [dominoweb.draco.res.ibm.com/reports/rj5118.pdf](https://dominoweb.draco.res.ibm.com/reports/rj5118.pdf)
+
+3. <a id="ref-hazard-pointers"></a> Michael, M. M. (2004). **Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects**. *IEEE Transactions on Parallel and Distributed Systems* **15**(6), 491–504. DOI 10.1109/TPDS.2004.8. [doi.org/10.1109/TPDS.2004.8](https://doi.org/10.1109/TPDS.2004.8)
+
+4. <a id="ref-michael-scott"></a> Michael, M. M., & Scott, M. L. (1996). **Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms**. In *PODC '96*, 267–275. DOI 10.1145/248052.248106. [doi.org/10.1145/248052.248106](https://doi.org/10.1145/248052.248106)
+
+5. <a id="ref-fraser"></a> Fraser, K. (2004). **Practical Lock-Freedom**. PhD thesis / Cambridge Computer Laboratory Technical Report **UCAM-CL-TR-579**, February 2004. Содержит epoch-based reclamation, lock-free skip-list, red-black tree и RB-tree-варианты. [www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf](https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf)
+
+6. <a id="ref-harris"></a> Harris, T. L. (2001). **A Pragmatic Implementation of Non-Blocking Linked-Lists**. In *DISC 2001*, LNCS 2180, 300–314. Springer. DOI 10.1007/3-540-45414-4_21. [doi.org/10.1007/3-540-45414-4_21](https://doi.org/10.1007/3-540-45414-4_21)
+
+7. <a id="ref-bw-tree"></a> Levandoski, J. J., Lomet, D. B., & Sengupta, S. (2013). **The Bw-Tree: A B-tree for New Hardware Platforms**. In *IEEE ICDE 2013*, 302–313. DOI 10.1109/ICDE.2013.6544834. [doi.org/10.1109/ICDE.2013.6544834](https://doi.org/10.1109/ICDE.2013.6544834)
+
+8. <a id="ref-shalev-shavit"></a> Shalev, O., & Shavit, N. (2006). **Split-Ordered Lists: Lock-Free Extensible Hash Tables**. *Journal of the ACM* **53**(3), 379–405. DOI 10.1145/1147954.1147958. [doi.org/10.1145/1147954.1147958](https://doi.org/10.1145/1147954.1147958)
+
+9. <a id="ref-michael-spaa"></a> Michael, M. M. (2002). **High Performance Dynamic Lock-Free Hash Tables and List-Based Sets**. In *SPAA '02*, 73–82. DOI 10.1145/564870.564881. [doi.org/10.1145/564870.564881](https://doi.org/10.1145/564870.564881)
+
+10. <a id="ref-arm-lse"></a> Arm Ltd. **Learn the architecture: Large System Extensions (LSE)**. Описание инструкций `CAS` / `CASA` / `CASL` / `CASAL`, появившихся в ARMv8.1; контраст с парами `LDXR` / `STXR` (LL/SC). [learn.arm.com/learning-paths/servers-and-cloud-computing/lse/intro](https://learn.arm.com/learning-paths/servers-and-cloud-computing/lse/intro/)
+
+11. <a id="ref-jep-188"></a> OpenJDK. **JEP 188: Java Memory Model Update**. Цели — уточнить и формализовать модель JSR-133 для конструкций, добавленных после Java 5 (`VarHandle`, `weakCompareAndSet`, opaque-режим). [openjdk.org/jeps/188](https://openjdk.org/jeps/188)
+
+12. <a id="ref-clq-source"></a> OpenJDK. **`java/util/concurrent/ConcurrentLinkedQueue.java`** (HEAD-исходник OpenJDK 25). Внутрикодовый комментарий явно ссылается на алгоритм Michael & Scott PODC 1996 и поясняет, почему в GC-среде не нужны counted-pointers. [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentLinkedQueue.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentLinkedQueue.java)
+
+13. <a id="ref-cslm-javadoc"></a> Oracle. **`ConcurrentSkipListMap` (Java SE 25 API)**. Javadoc прямо указывает, что реализация — концурентный вариант skip-list'ов на основе работ Fraser и Harris. [docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html)
+
+14. <a id="ref-rcu-doc"></a> McKenney, P. E. et al. **What is RCU, Fundamentally?** Документация ядра Linux, `Documentation/RCU/whatisRCU.rst`. Содержит формальные требования к grace-period detection и read-side primitive `rcu_dereference`. [www.kernel.org/doc/html/latest/RCU/whatisRCU.html](https://www.kernel.org/doc/html/latest/RCU/whatisRCU.html)
+
+15. <a id="ref-disruptor"></a> Thompson, M., Farley, D., Barker, M., Gee, P., & Stewart, A. (2011). **Disruptor: High Performance Alternative to Bounded Queues for Exchanging Data Between Concurrent Threads**. LMAX Technical Paper. Сами авторы фиксируют, что Disruptor lock-free, **но не wait-free**: producer'ы конкурируют за позиции через CAS, и один из них может проигрывать гонку неограниченно долго. [lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf](https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf)
+
+16. <a id="ref-kogan-petrank"></a> Kogan, A., & Petrank, E. (2011). **Wait-Free Queues with Multiple Enqueuers and Dequeuers**. In *PPoPP '11*, 223–234. DOI 10.1145/1941553.1941585. Первая wait-free FIFO-очередь с произвольным числом потоков, основанная на helping и announce-array. [doi.org/10.1145/1941553.1941585](https://doi.org/10.1145/1941553.1941585)
+
+17. <a id="ref-jsr-133"></a> Manson, J., Pugh, W., & Adve, S. V. (2005). **The Java Memory Model**. In *POPL '05*, 378–391. DOI 10.1145/1040305.1040336. Формальная модель, реализованная в JVM начиная с Java 5 (JSR-133). [doi.org/10.1145/1040305.1040336](https://doi.org/10.1145/1040305.1040336)
+
+18. <a id="ref-pathfinder"></a> Reeves, G. E. (1997). **What Really Happened on Mars?** Authoritative account of the Mars Pathfinder priority-inversion bug; VxWorks mutex без флага priority inheritance. [www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html](https://www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html)
+
+19. <a id="ref-postgres-lwlock"></a> PostgreSQL Global Development Group. **Lightweight Locks (LWLocks)**. Внутренняя документация и комментарии в `src/backend/storage/lmgr/lwlock.c`; описывает шардирование `WALInsertLock` на 8 слотов и его lock-free-резервацию позиций. [github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c](https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c)
+
+20. <a id="ref-hendler-shavit"></a> Hendler, D., Shavit, N., & Yerushalmi, L. (2004). **A Scalable Lock-Free Stack Algorithm**. In *SPAA '04*, 206–215. DOI 10.1145/1007912.1007944. Источник численных данных для графика выше (Figure 7, 14-node Sun Enterprise E6500, 50% push / 50% pop). [doi.org/10.1145/1007912.1007944](https://doi.org/10.1145/1007912.1007944)
+
+21. <a id="ref-mcs"></a> Mellor-Crummey, J. M., & Scott, M. L. (1991). **Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors**. *ACM TOCS* **9**(1), 21–65. DOI 10.1145/103727.103729. Канонический MCS-лок — масштабируемый спин-лок с локальной cache-line на ожидающем; используется в раздел «Визуализация» как базовая блокирующая альтернатива. [doi.org/10.1145/103727.103729](https://doi.org/10.1145/103727.103729)
