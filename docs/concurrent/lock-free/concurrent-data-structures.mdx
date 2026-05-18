@@ -12,7 +12,7 @@ import ReactECharts from 'echarts-for-react';
 Классический способ обеспечить корректный доступ к разделяемой структуре данных из нескольких потоков — взять мьютекс. Семантика проста, доказательства линеаризуемости тривиальны, но платой служит **блокирующее поведение**: если поток-владелец захвачен прерыванием, page fault'ом, GC-паузой или просто вытеснен планировщиком, все остальные потоки, ждущие тот же замок, тоже встают. На практике это даёт три знакомых патологии:
 
 - **Lock convoy.** Поток отпускает мьютекс, его сразу подбирает другой; первый, проснувшись, встаёт в конец очереди. Под высокой нагрузкой пропускная способность падает в разы.
-- **Priority inversion.** Низкоприоритетный поток держит замок, нужный высокоприоритетному; среднеприоритетный поток вытесняет низкоприоритетный, и высокоприоритетный ждёт неограниченно долго. Канонический пример — Mars Pathfinder (1997): мьютекс bus management в VxWorks был создан без флага priority inheritance, что приводило к watchdog-перезагрузкам марсохода [[18](#ref-pathfinder)].
+- **Priority inversion.** Низкоприоритетный поток держит замок, нужный высокоприоритетному; среднеприоритетный поток вытесняет низкоприоритетный, и высокоприоритетный ждёт неограниченно долго. Канонический пример — Mars Pathfinder (1997): в VxWorks бинарный IPC-семафор внутри `select()` удерживала низкоприоритетная задача метеорологии ASI/MET, на нём блокировалась высокоприоритетная задача распределения шины `bc_dist` (bus distribution), а вытеснение средне­приоритетной communications-задачей затягивало блокировку настолько, что watchdog перезагружал систему [[18](#ref-pathfinder)].
 - **Stop-the-world эффекты.** Любая задержка владельца замка масштабируется на всех ждущих; в распределённых и real-time системах это недопустимо.
 
 В системных и СУБД-движках та же проблема возникает повсеместно. PostgreSQL имеет десятки **LWLock** для разделяемой памяти (буферный пул, WAL-инсерт, ProcArray); под нагрузкой `WALInsertLock` исторически становится горлышком и потребовал шардирования на 8 «слотов» [[19](#ref-postgres-lwlock)]. InnoDB использует latch'и на B-tree-страницы (latch coupling) — именно их избегает **Bw-tree** [[7](#ref-bw-tree)], хранящий состояние страниц как цепочку delta-записей и переключающий версии одним CAS. MVCC-движки (Postgres, Oracle) держат версионные цепочки и атомарно переключают snapshot-указатели, не блокируя читателей. Linux-ядро использует **RCU** в dcache, ip-routing и BPF-картах, где счёт читателей идёт на миллионы операций в секунду [[14](#ref-rcu-doc)].
@@ -170,7 +170,7 @@ Cliff Click опубликовал (2007) NonBlockingHashMap для Java на п
 
 Keir Fraser, *Practical Lock-Freedom*, Cambridge UCAM-CL-TR-579 (2004) [[5](#ref-fraser)]; Fraser & Harris (2007). Каждый уровень skip-list'а — Harris-список с маркером удаления; вставка идёт снизу вверх через серию CAS, удаление — пометка на каждом уровне + физический unlink. `O(log n)` ожидаемая стоимость, никаких глобальных замков.
 
-**Production user:** OpenJDK `java.util.concurrent.ConcurrentSkipListMap` — концурентный навигируемый map на skip-list'е. javadoc прямо указывает, что реализация Doug Lea основана на работах Fraser и Harris [[13](#ref-cslm-javadoc)].
+**Production user:** OpenJDK `java.util.concurrent.ConcurrentSkipListMap` — концурентный навигируемый map на skip-list'е. class-level комментарий в исходнике (Doug Lea) явно указывает, что реализация основана на работах Fraser и Harris [[13](#ref-cslm-javadoc)].
 
 ### Bw-tree (ICDE 2013)
 
@@ -190,7 +190,7 @@ Justin J. Levandoski, David B. Lomet, Sudipta Sengupta. *The Bw-Tree: A B-tree f
 | Механизм | Идея | Стоимость на reader | Стоимость на reclamation | Production |
 |---|---|---|---|---|
 | **Hazard Pointers** [[3](#ref-hazard-pointers)] | Каждый поток публикует ≤K «защищённых» указателей; reclaimer проверяет реестр | один atomic-store + memory fence на доступ | сканирование реестра потоков, `O(N·K)` | C++ Folly, ConcurrencyFreaks, проект C++26 `std::hazard_pointer` |
-| **EBR** (epoch-based) [[5](#ref-fraser)] | Глобальная эпоха; поток на входе помечает «я в эпохе E»; reclaimer ждёт, пока все ушли вперёд | один atomic-store на критическую секцию | дешевле HP при множестве защищаемых ссылок | Rust crate `crossbeam-epoch`, ядро NetBSD (`vmem`) |
+| **EBR** (epoch-based) [[5](#ref-fraser)] | Глобальная эпоха; поток на входе помечает «я в эпохе E»; reclaimer ждёт, пока все ушли вперёд | один atomic-store на критическую секцию | дешевле HP при множестве защищаемых ссылок | Rust crate `crossbeam-epoch`, ядро NetBSD (`pserialize(9)`) [[22](#ref-pserialize)] |
 | **RCU** (read-copy-update) [[14](#ref-rcu-doc)] | Писатель публикует копию атомарным swap'ом; читатели идут совершенно без синхронизации; reclaimer ждёт grace period (все потоки прошли quiescent state) | **ноль** (только зависимостный read) | grace-period detection: tick-based в ядре | Linux kernel: dcache, IP routing, BPF maps; userspace-RCU (liburcu) |
 
 Hazard pointers и EBR применимы из user-space; RCU исторически — kernel-механизм, но liburcu даёт userspace-вариант. Выбор: **RCU**, если читатели — горячий путь и обновлений мало; **HP**, если число защищаемых указателей на поток ограничено константой; **EBR**, если потоков много и важна простота.
@@ -213,11 +213,14 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 - **Treiber stack + exponential backoff** — тот же CAS-цикл, но при промахе CAS поток ждёт растущий промежуток времени; throughput держится почти на уровне одного потока.
 - **MCS lock + serial stack** — лок-стек на MCS-локе [[21](#ref-mcs)] для контраста; работает стабильно, но не масштабируется по числу потоков (последовательное горлышко).
 
+**Иллюстративные значения, не репродукция Figure 7.** Точки на графике ниже подобраны качественно — они отражают характер кривых из Hendler–Shavit–Yerushalmi SPAA 2004, но не являются дословным переносом измерений из Figure 7 (PDF Figure 7 не парсится автоматически). Машина в оригинале — 14-CPU Sun Enterprise E6500 (7 boards × 2 × UltraSPARC 400 MHz, Solaris 9); точки правее x=14 — режим oversubscription (потоков больше, чем физических ядер).
+
 <ReactECharts
   style={{ height: 380 }}
   option={{
     title: {
-      text: 'Пропускная способность стека под контеншеном (Hendler, Shavit, Yerushalmi, SPAA 2004, Figure 7)',
+      text: 'Пропускная способность стека под контеншеном',
+      subtext: 'По мотивам Hendler–Shavit–Yerushalmi SPAA 2004; 14-CPU Sun E6500. Иллюстративные точки.',
       left: 'center',
       textStyle: { fontSize: 13 },
     },
@@ -247,6 +250,12 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
         type: 'line',
         symbolSize: 8,
         data: [[1, 2700], [2, 700], [4, 400], [8, 300], [14, 250], [32, 200]],
+        markLine: {
+          silent: true,
+          symbol: 'none',
+          lineStyle: { color: '#888', type: 'dashed' },
+          data: [{ xAxis: 14, label: { formatter: '14 CPU (физический предел E6500)', position: 'insideEndTop' } }],
+        },
       },
       {
         name: 'Treiber + exp. backoff',
@@ -310,7 +319,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 
 12. <a id="ref-clq-source"></a> OpenJDK. **`java/util/concurrent/ConcurrentLinkedQueue.java`** (HEAD-исходник OpenJDK 25). Внутрикодовый комментарий явно ссылается на алгоритм Michael & Scott PODC 1996 и поясняет, почему в GC-среде не нужны counted-pointers. [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentLinkedQueue.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentLinkedQueue.java)
 
-13. <a id="ref-cslm-javadoc"></a> Oracle. **`ConcurrentSkipListMap` (Java SE 25 API)**. Javadoc прямо указывает, что реализация — концурентный вариант skip-list'ов на основе работ Fraser и Harris. [docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html)
+13. <a id="ref-cslm-javadoc"></a> Oracle / OpenJDK. **`java/util/concurrent/ConcurrentSkipListMap.java`** (HEAD-исходник OpenJDK). Class-level комментарий (Doug Lea) явно указывает, что реализация — концурентный вариант skip-list'ов на основе работ Fraser и Harris (не публичный Javadoc API, а внутрикодовая атрибуция). [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentSkipListMap.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentSkipListMap.java)
 
 14. <a id="ref-rcu-doc"></a> McKenney, P. E. et al. **What is RCU, Fundamentally?** Документация ядра Linux, `Documentation/RCU/whatisRCU.rst`. Содержит формальные требования к grace-period detection и read-side primitive `rcu_dereference`. [www.kernel.org/doc/html/latest/RCU/whatisRCU.html](https://www.kernel.org/doc/html/latest/RCU/whatisRCU.html)
 
@@ -322,8 +331,10 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 
 18. <a id="ref-pathfinder"></a> Reeves, G. E. (1997). **What Really Happened on Mars?** Authoritative account of the Mars Pathfinder priority-inversion bug; VxWorks mutex без флага priority inheritance. [www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html](https://www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html)
 
-19. <a id="ref-postgres-lwlock"></a> PostgreSQL Global Development Group. **Lightweight Locks (LWLocks)**. Внутренняя документация и комментарии в `src/backend/storage/lmgr/lwlock.c`; описывает шардирование `WALInsertLock` на 8 слотов и его lock-free-резервацию позиций. [github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c](https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c)
+19. <a id="ref-postgres-lwlock"></a> PostgreSQL Global Development Group. **WAL insertion locks (`xlog.c`)**. Файл `src/backend/access/transam/xlog.c` определяет `NUM_XLOGINSERT_LOCKS = 8` и массив `WALInsertLocks` — шардирование `WALInsertLock` на 8 слотов с lock-free reservation позиции через FAA. [github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c](https://github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c)
 
 20. <a id="ref-hendler-shavit"></a> Hendler, D., Shavit, N., & Yerushalmi, L. (2004). **A Scalable Lock-Free Stack Algorithm**. In *SPAA '04*, 206–215. DOI 10.1145/1007912.1007944. Источник численных данных для графика выше (Figure 7, 14-node Sun Enterprise E6500, 50% push / 50% pop). [doi.org/10.1145/1007912.1007944](https://doi.org/10.1145/1007912.1007944)
 
 21. <a id="ref-mcs"></a> Mellor-Crummey, J. M., & Scott, M. L. (1991). **Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors**. *ACM TOCS* **9**(1), 21–65. DOI 10.1145/103727.103729. Канонический MCS-лок — масштабируемый спин-лок с локальной cache-line на ожидающем; используется в раздел «Визуализация» как базовая блокирующая альтернатива. [doi.org/10.1145/103727.103729](https://doi.org/10.1145/103727.103729)
+
+22. <a id="ref-pserialize"></a> The NetBSD Project. **`pserialize(9)` — passive serialization**. NetBSD kernel manual; механизм quiescent-state / epoch-style reclamation для lock-free структур ядра. Реализация — `sys/kern/subr_pserialize.c`. [man.netbsd.org/pserialize.9](https://man.netbsd.org/pserialize.9)
