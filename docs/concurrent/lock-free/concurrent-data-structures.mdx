@@ -123,7 +123,7 @@ R. Kent Treiber, IBM Research Report **RJ 5118**, апрель 1986 [[2](#ref-tr
 - **Идея:** вершина стека — единственная разделяемая ссылка; модификация — атомарный CAS этой ссылки.
 - **Инвариант:** список достижим из `top`, каждое ребро `next` неизменно после публикации.
 - **Стоимость:** `O(1)` на операцию в отсутствие конкуренции; под высоким контеншеном — серия CAS-промахов; latency деградирует линейно по числу потоков, throughput выходит на плато (см. раздел «Визуализация»).
-- **Production user:** свободный список узлов в стандартной библиотеке Java (`AbstractQueuedSynchronizer` использует Treiber-подобный CAS-стек ожидающих узлов).
+- **Production user:** список ожидающих потоков в `java.util.concurrent.FutureTask` (внутренний класс `WaitNode` — внутрикодовый комментарий явно говорит «Simple linked list nodes to record waiting threads in a Treiber stack») [[23](#ref-futuretask-source)]; те же идеи использованы в `Phaser` и `SynchronousQueue`. (`AbstractQueuedSynchronizer`, напротив, использует FIFO-вариант CLH-очереди, а не Treiber-стек.)
 
 ### Michael–Scott queue (PODC 1996)
 
@@ -161,10 +161,10 @@ Timothy L. Harris. *A Pragmatic Implementation of Non-Blocking Linked-Lists*, DI
 
 Два классических подхода:
 
-- **Закрытое хеширование с lock-free chains** (Michael, SPAA 2002): каждый bucket — Harris-список, `find/insert/delete` через двухшаговое удаление. Расширение (resize) дороже — обычно блокирующее или incremental.
+- **Открытое хеширование (separate chaining) с lock-free-цепочками** (Michael, SPAA 2002): каждый bucket — Harris-список, `find/insert/delete` через двухшаговое удаление. Расширение (resize) дороже — обычно блокирующее или incremental.
 - **Split-ordered lists** (Shalev & Shavit, JACM 53(3), 2006) [[8](#ref-shalev-shavit)]: единый отсортированный связный список; bucket-указатели вставляют sentinel-узлы. Resize — это просто увеличение числа bucket'ов и **никакого** перепланирования цепочек: split-ordering гарантирует, что новые bucket'ы проходят в правильное место списка. `O(1)` ожидаемая стоимость операции, lock-free вставки/удаления через Harris-маркеры.
 
-Cliff Click опубликовал (2007) NonBlockingHashMap для Java на принципах **FSM-state-машины** ячейки; алгоритм быстрый практически, но в литературе линеаризуемость и lock-free-свойства остаются предметом дискуссии — формальных доказательств нет, рекомендуется использовать с осторожностью.
+Cliff Click опубликовал (2007) NonBlockingHashMap для Java на принципах **FSM-state-машины** ячейки; алгоритм быстро работает на практике, но peer-reviewed формального доказательства линеаризуемости и lock-free-свойств в литературе нет — оба свойства держатся на конструктивном описании автора.
 
 ### Lock-free skip list
 
@@ -274,7 +274,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
   }}
 />
 
-Главный вывод: **lock-free сам по себе не даёт масштабируемости** — Treiber без backoff проигрывает MCS-локу уже при четырёх потоках. Хорошее масштабирование возникает только при добавлении дисциплины разрешения конфликтов: backoff (как у Treiber + backoff) или элиминации (Hendler–Shavit–Yerushalmi показывают, что elimination-backoff stack достигает ~7500 ops/сек при 32 потоках на тех же измерениях). Урок: «lock-free» — это про прогресс, а не про скорость.
+Главный вывод: **lock-free сам по себе не даёт масштабируемости** — Treiber без backoff проигрывает MCS-локу уже при четырёх потоках. Хорошее масштабирование возникает только при добавлении дисциплины разрешения конфликтов: backoff (как у Treiber + backoff) или элиминации (Hendler–Shavit–Yerushalmi показывают, что elimination-backoff stack качественно масштабируется почти линейно по числу потоков, тогда как обычный Treiber выходит на плато; конкретные числа Figure 7 в этой статье не воспроизведены поточечно). Урок: «lock-free» — это про прогресс, а не про скорость.
 
 ## Сравнение с альтернативами
 
@@ -338,3 +338,5 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 21. <a id="ref-mcs"></a> Mellor-Crummey, J. M., & Scott, M. L. (1991). **Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors**. *ACM TOCS* **9**(1), 21–65. DOI 10.1145/103727.103729. Канонический MCS-лок — масштабируемый спин-лок с локальной cache-line на ожидающем; используется в раздел «Визуализация» как базовая блокирующая альтернатива. [doi.org/10.1145/103727.103729](https://doi.org/10.1145/103727.103729)
 
 22. <a id="ref-pserialize"></a> The NetBSD Project. **`pserialize(9)` — passive serialization**. NetBSD kernel manual; механизм quiescent-state / epoch-style reclamation для lock-free структур ядра. Реализация — `sys/kern/subr_pserialize.c`. [man.netbsd.org/pserialize.9](https://man.netbsd.org/pserialize.9)
+
+23. <a id="ref-futuretask-source"></a> OpenJDK. **`java/util/concurrent/FutureTask.java`** (HEAD-исходник OpenJDK). Внутренний класс `WaitNode` — Treiber-стек ожидающих потоков (внутрикодовый комментарий: «Simple linked list nodes to record waiting threads in a Treiber stack. See other classes such as Phaser and SynchronousQueue for more detailed explanation.»). Вставка узла — `WAITERS.weakCompareAndSet(this, q.next = waiters, q)` на единственном `volatile`-указателе `waiters`. [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/FutureTask.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/FutureTask.java)
