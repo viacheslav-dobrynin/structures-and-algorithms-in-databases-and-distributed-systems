@@ -1,0 +1,407 @@
+---
+title: ConcurrentHashMap в Java
+sidebar_position: 1
+---
+
+import ReactECharts from 'echarts-for-react';
+
+# ConcurrentHashMap в Java
+
+## Мотивация
+
+Базовая `java.util.HashMap` — **не потокобезопасна**: одновременная модификация из двух потоков может оставить корзину в полусобранном состоянии, разорвать цепочку или зациклить указатели (исторически — печально известный «infinite loop on resize» в Java 7, демонстрировавшийся CPU-spike'ом на 100% в проде). Стандартная библиотека предлагала исторически три обходных решения, и у каждого есть фундаментальные ограничения.
+
+- **`Hashtable` (с 1.0).** Каждый публичный метод объявлен `synchronized` на самом объекте таблицы. Один глобальный монитор сериализует все операции — пропускная способность не растёт с числом потоков, а на read-mostly-нагрузках платится лишний `monitorenter` за каждое чтение. Brian Goetz, Tim Peierls et al. в *Java Concurrency in Practice* §4.4.1 [[1](#ref-jcip)] называют этот стиль **monitor-based class** и явно указывают, что для контеншена он непригоден.
+- **`Collections.synchronizedMap(new HashMap<>())`.** Враппер над любой `Map` — тот же глобальный монитор, что и `Hashtable`. Итерация требует **внешней** синхронизации (`synchronized (m) { for (... : m.keySet()) ... }`); иначе любой конкурентный `put` бросит `ConcurrentModificationException`. JCiP §5.1 [[1](#ref-jcip)] подробно разбирает этот паттерн как источник скрытых багов.
+- **`HashMap` + явный `synchronized`-блок.** Программист сам берёт мьютекс на каждой операции. Гибче, но семантика **атомарной композиции** (`if (!map.containsKey(k)) map.put(k, v);`) тут не выводится из библиотеки — её нужно конструировать руками, и легко ошибиться. JCiP §5.2 [[1](#ref-jcip)] говорит дословно: «*compound actions* on synchronized collections (iteration, navigation, conditional operations such as put-if-absent) are not thread-safe even though the individual operations are». То есть индивидуальные методы безопасны, но `putIfAbsent`-подобные последовательности — нет.
+
+`ConcurrentHashMap` (CHM), введённый в Java 5 в составе JSR-166 [[3](#ref-jsr166)] и переписанный Doug Lea в Java 8, решает все три задачи:
+
+1. **Никакого глобального монитора** — корзины таблицы блокируются индивидуально, и большинство чтений вообще проходит без блокировок (через `volatile`-семантику на ячейках массива).
+2. **Атомарные compose-операции** (`putIfAbsent`, `compute`, `computeIfAbsent`, `merge`) встроены в API; javadoc гарантирует, что «*The entire method invocation is performed atomically*» [[2](#ref-jdk-chm)].
+3. **Weakly consistent** итераторы не бросают `ConcurrentModificationException` — они отражают состояние, в котором таблица была «в какой-то момент с момента создания итератора», и никогда не падают на конкурентной модификации.
+
+## API и базовый контракт
+
+Класс объявлен следующим образом (HEAD-исходник OpenJDK [[2](#ref-jdk-chm)]):
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
+    implements ConcurrentMap<K,V>, Serializable
+```
+
+Метаданные исходника:
+
+- `@author Doug Lea` — единственный автор файла.
+- `@since 1.5` — класс введён в Java 5 (Tiger, 2004) как часть `java.util.concurrent`.
+- В шапке файла: «*Written by Doug Lea with assistance from members of JCP JSR-166 Expert Group and released to the public domain*» — формальная связь с JSR-166 [[3](#ref-jsr166)].
+
+Иерархия типов (Java 21+):
+```
+java.lang.Object
+  └─ java.util.AbstractMap<K,V>
+       └─ java.util.concurrent.ConcurrentHashMap<K,V>
+            implements ConcurrentMap<K,V>, Serializable
+```
+`ConcurrentMap` — sub-interface `Map`, добавляющий атомарные compose-операции (`putIfAbsent`, `replace`, `remove(K,V)`).
+
+Ключевые свойства контракта, заданные javadoc'ом [[2](#ref-jdk-chm)]:
+
+- **`null` запрещён.** «*Like Hashtable but unlike HashMap, this class does not allow null to be used as a key or value*». Метод `put` явно говорит: «*Neither the key nor the value can be null*». Причина — атомарность `get`: если бы `null` был валидным значением, `map.get(k) == null` было бы двусмысленно (ключ отсутствует **или** ключ присутствует со значением `null`). В однопоточной `HashMap` это разрешается отдельным `containsKey`, но в конкурентной среде между `get` и `containsKey` другой поток мог удалить запись, и контракт «`null` ⇔ нет записи» развалился бы.
+- **`ConcurrentMap`-интерфейс.** Добавляет `putIfAbsent(K, V)`, `remove(K, V)`, `replace(K, V)`, `replace(K, V, V)` — атомарные compose-операции, отсутствующие в `Map`.
+- **`size()` приближённый.** «*The value returned is an estimate; the actual count may differ if there are concurrent insertions or removals*».
+
+## Эволюция реализации
+
+Между Java 5 и современным OpenJDK реализация переписывалась дважды. Все три варианта стоит знать — собеседования, профили старых приложений и легаси-код регулярно отсылают к ним.
+
+### Java 5/6 — segmented locking
+
+Внутренний массив `Segment[]` фиксированной длины (по умолчанию 16). Каждый сегмент — мини-`HashMap` со своим `ReentrantLock`. Параметр `concurrencyLevel` конструктора задавал число сегментов и оценивал «*the estimated number of concurrently updating threads*». Запись блокировала только свой сегмент; читатели в идеальном случае работали **без замков** через `volatile`-чтение `count` и доли-вторичные проверки. Доказательство корректности read-side у Doug Lea опирается на `volatile`-семантику Java 5 (новая модель памяти JSR-133 [[1](#ref-jcip)]).
+
+Проблемы:
+- **Память.** 16 сегментов даже на пустой таблице — десятки байт overhead'а на каждый из 16 локов и сегментных массивов.
+- **Грубое шардирование.** На многоядерных машинах с числом потоков ≫ 16 контеншен возвращался: разные ключи попадали в один сегмент по `hash % 16`.
+
+### Java 7 — lazy segment init + Unsafe CAS
+
+Та же сегментация, но сегменты создавались **лениво** при первой записи через `Unsafe.compareAndSwapObject` на слот массива сегментов. Это удешевило конструктор и пустые карты, но фундаментальную проблему фиксированного шардирования не решило.
+
+### Java 8 — полная переписка
+
+Doug Lea переписал CHM целиком. Сегменты исчезли. Структура стала похожа на `HashMap` с дополнительной concurrency-механикой:
+
+- Единый массив `Node<K,V>[] table`. Каждая корзина (bin) — либо `null`, либо голова списка `Node`, либо `TreeBin` (упорядоченный балансированный бинарный поиск).
+- **CAS на пустой корзине.** Первая вставка в `null`-bin выполняется через `Unsafe.compareAndSwapObject` на слоте массива — без захвата мьютекса.
+- **`synchronized(head)` на непустой корзине.** Если корзина уже содержит цепочку, пишущий поток берёт `synchronized`-блок на её **head**-узле. Другие корзины при этом полностью независимы.
+- **Treeification** — длинная цепочка превращается в красно-чёрное дерево. Hash flooding (атакующий подаёт ключи с коллидирующим `hashCode`) даёт всё ещё `O(log n)` на корзину вместо `O(n)`.
+- **Многопоточный resize.** При расширении таблицы помогающие потоки получают «полосы» (stride) индексов и параллельно переносят данные.
+
+С Java 8 каждый bin — независимый «мини-замок», что фактически даёт concurrency level = размер таблицы (тысячи), а не 16.
+
+## Ключевые механизмы Java 8+
+
+### Константы (значения из HEAD-исходника OpenJDK)
+
+Все значения процитированы дословно из `ConcurrentHashMap.java` [[2](#ref-jdk-chm)].
+
+| Имя | Значение | Назначение |
+|---|---|---|
+| `DEFAULT_CAPACITY` | `16` | Начальный размер `table`, если не указан явно. |
+| `MAXIMUM_CAPACITY` | `1 << 30` | Верхняя граница длины массива (2^30); следующая степень двойки уже не помещается в `int`. |
+| `LOAD_FACTOR` | `0.75f` | Используется только для оценки начальной ёмкости; динамически таблица растёт по другому порогу `sizeCtl`. |
+| `TREEIFY_THRESHOLD` | `8` | При длине цепочки в bin'е ≥ 8 — кандидат на treeification. |
+| `UNTREEIFY_THRESHOLD` | `6` | При сжатии дерева обратно в список (после remove) — порог обратного перехода. Гистерезис (8 vs 6) предотвращает осцилляции. |
+| `MIN_TREEIFY_CAPACITY` | `64` | Treeification разрешена только если `table.length ≥ 64`; иначе предпочтительнее `resize`. |
+| `MIN_TRANSFER_STRIDE` | `16` | Минимальная «полоса» индексов, передаваемая помогающему потоку при resize. |
+| `RESIZE_STAMP_BITS` | `16` | Число бит, выделенных под «штамп» текущего resize в `sizeCtl`; нижние биты считают помогающие потоки. |
+
+### Hash-маркеры
+
+Внутри `Node.hash` несколько «магических» отрицательных значений сигнализируют о специальном состоянии bin'а [[2](#ref-jdk-chm)]:
+
+| Константа | Значение | Семантика |
+|---|---|---|
+| `MOVED` | `-1` | Bin перенесён в новую таблицу; в текущей стоит `ForwardingNode`, перенаправляющий читателей на `nextTable`. |
+| `TREEBIN` | `-2` | Голова bin'а — `TreeBin`-обёртка над красно-чёрным деревом. |
+| `RESERVED` | `-3` | Bin зарезервирован для `computeIfAbsent`/`compute` (предотвращает recursive update на тот же ключ). |
+
+Поскольку обычный `hashCode` приводится `spread()` к неотрицательному значению, отрицательные маркеры не сталкиваются с регулярными bin'ами.
+
+### Жизненный цикл bin'а
+
+1. **Пустой bin (`null` в слоте).** Вставка идёт через `casTabAt(tab, i, null, newNode)`: атомарный CAS заменяет `null` на новый `Node`. Если CAS промахнулся — другой поток успел вставить, идём по медленному пути.
+2. **Непустой bin.** Поток берёт `synchronized` на head-узле. Внутри блока он либо обходит цепочку (линейный список), либо вызывает `TreeBin.putTreeVal` (если head — `TreeBin`).
+3. **Treeification.** Если после вставки длина цепочки достигла `TREEIFY_THRESHOLD = 8`, поток проверяет: если `table.length ≥ MIN_TREEIFY_CAPACITY = 64`, цепочка перестраивается в красно-чёрное дерево через `treeifyBin`. Иначе вызывается `tryPresize` — таблица расширяется, и проблема коротких частых коллизий решается размером, а не структурой.
+4. **Untreeification.** Если в результате `remove` дерево уменьшается до `UNTREEIFY_THRESHOLD = 6` узлов, оно разворачивается обратно в список.
+
+### Resize: ForwardingNode + параллельные хелперы
+
+Расширение таблицы (`transfer`) — самый сложный механизм CHM. Его задача — удвоить размер `table` и перенести все bin'ы, **не останавливая других пишущих/читающих потоков**.
+
+- Поле `sizeCtl` совмещает несколько ролей: отрицательное значение в Java 8+ означает «идёт resize», верхние `RESIZE_STAMP_BITS = 16` бит содержат **resize stamp** (идентификатор данного расширения, основанный на текущем размере), нижние биты — счётчик активных помогающих потоков.
+- Каждый помогающий поток получает «полосу» индексов (`stride`) длиной ≥ `MIN_TRANSFER_STRIDE = 16`. На многопроцессорной машине stride рассчитывается как `(table.length >>> 3) / NCPU`, но не меньше 16.
+- Когда поток уносит bin в `nextTable`, в старой таблице на это место кладётся **`ForwardingNode`** с `hash = MOVED = -1`. Любой читатель, увидевший `ForwardingNode`, **переходит в `nextTable`** и продолжает поиск там.
+- Пишущий поток, попавший в bin с `ForwardingNode`, вызывает `helpTransfer`: вместо ожидания он берёт свободную полосу и помогает завершить resize. Так число «помощников» масштабируется с нагрузкой.
+
+Численный пример: при `table.length = 4096` и `NCPU = 8` stride будет `4096 / 8 / 8 = 64` (нижняя граница `MIN_TRANSFER_STRIDE = 16` не активна). Это значит, что 8 рабочих потоков могут параллельно переносить 8 непересекающихся блоков по 64 bin'а каждый, синхронизируясь только на CAS-захвате очередной полосы через `transferIndex` (volatile-курсор от конца к началу таблицы). Алгоритм наследует идею **work-stealing**: первый поток, обнаруживший необходимость resize, инициирует процесс; остальные подключаются по мере поступления и берут оставшиеся полосы. Когда все полосы обработаны, последний поток выполняет финальную замену `table = nextTable` и обнуляет `nextTable`.
+
+Важная инвариантная гарантия: **читатель никогда не видит частично перенесённую таблицу**. Если он видит `ForwardingNode` на месте интересующего bin'а, метод `find` `ForwardingNode`'а рекурсивно переходит в `nextTable` и продолжает поиск там. Это обеспечивает линеаризуемость `get` относительно resize.
+
+### Счётчик `baseCount + CounterCell[]` (LongAdder-pattern)
+
+Точный размер CHM нельзя считать одним `AtomicLong` — это превратило бы счётчик в горлышко на write-heavy нагрузке (cache-line ping-pong). CHM использует **striped counter**, тот же приём, что в `java.util.concurrent.atomic.LongAdder`:
+
+- Поле `baseCount` (volatile long) — основной счётчик; при отсутствии конкуренции инкрементируется CAS-ом.
+- Массив `CounterCell[] counterCells` — массив «ячеек», по одной на горячий поток. Поток, у которого CAS на `baseCount` промахнулся, перенаправляется на свою (по `ThreadLocalRandom`) ячейку.
+- `size()` = `baseCount + Σ counterCells[i].value`.
+
+Чтение `size()`/`mappingCount()` не блокирует ни пишущих, ни друг друга; цена за это — приближённость результата (см. ниже §6).
+
+### Атомарные compose-операции
+
+`compute`, `computeIfAbsent`, `computeIfPresent`, `merge` — атомарные **именно для одного ключа**, не для всей таблицы. Javadoc дословно [[2](#ref-jdk-chm)]:
+
+> *If the specified key is not already associated with a value, attempts to compute its value using the given mapping function and enters it into this map unless null. **The entire method invocation is performed atomically.** The supplied function is invoked exactly once per invocation of this method if the key is absent, else not at all.*
+
+Реализация держит `synchronized` на head-узле bin'а на время вызова пользовательской функции, **поэтому**:
+
+- Лямбда выполняется ровно один раз для отсутствующего ключа.
+- Никакой другой поток не увидит ключ в полусобранном состоянии.
+- **Подводный камень:** если внутри `computeIfAbsent` вызвать тот же `map.computeIfAbsent` на тот же ключ — поток попробует взять `synchronized` повторно (re-entry допустим), но если **другой** ключ попадает в **тот же bin** и блокируется — возможен deadlock. Javadoc прямо предупреждает:
+
+> *Some attempted update operations on this map by other threads may be blocked while computation is in progress, so the computation should be short and simple, and must not attempt to update any other mappings of this map.*
+
+Это не теоретическое опасение: bug-репорты JDK-8161372 и JDK-8172951 фиксировали именно такие зависания (с фиксом, бросающим `IllegalStateException` при детекции рекурсии в Java 9+, см. release notes).
+
+## Семантика `size()` / `mappingCount()` / `isEmpty()`
+
+CHM **не предоставляет snapshot** числа элементов. Javadoc [[2](#ref-jdk-chm)]:
+
+- `size()`: «*Returns the number of key-value mappings in this map. If the map contains more than Integer.MAX_VALUE elements, returns Integer.MAX_VALUE.*»
+- `mappingCount()`: «*Returns the number of mappings. This method should be used instead of size() because a ConcurrentHashMap may contain more mappings than can be represented as an int. The value returned is an estimate; the actual count may differ if there are concurrent insertions or removals.*»
+
+То есть:
+
+1. **`mappingCount()` возвращает `long`**, `size()` — `int` с насыщением на `Integer.MAX_VALUE`. Для таблиц с числом записей > 2^31 размер через `size()` теряет точность.
+2. **Ни одна из них не атомарный snapshot.** Между чтением `baseCount` и суммированием `counterCells` другой поток может вставить или удалить запись. Гарантия — *eventually consistent*, не *linearizable*.
+3. **`isEmpty()`** реализован независимо: он коротко-замкнут на проверку `sumCount() <= 0L`. По той же причине не snapshot.
+
+Практическое следствие: код вида `while (map.size() > 0) map.remove(map.keySet().iterator().next());` корректен, но `map.size() == n` не гарантируется даже сразу после `n` вставок из одного потока, если параллельно работают другие.
+
+## Weakly consistent итераторы
+
+Все view-коллекции CHM (`keySet()`, `values()`, `entrySet()`) и их итераторы/сплитераторы — **weakly consistent**. Javadoc package-summary `java.util.concurrent` определяет это понятие как набор гарантий:
+
+1. «*they may proceed concurrently with other operations*»;
+2. «*they will never throw `ConcurrentModificationException`*»;
+3. «*they are guaranteed to traverse elements as they existed upon construction exactly once, and may (but are not guaranteed to) reflect any modifications subsequent to construction*».
+
+То есть итератор фиксируется на состоянии, **существовавшем в какой-то момент с момента создания**, и проходит каждый существовавший тогда элемент ровно один раз; модификации, произошедшие после, могут отразиться, а могут — нет. В отличие от `HashMap`, CHM **никогда** не бросает `ConcurrentModificationException`.
+
+Это противоположный полюс от fail-fast-итераторов: предсказуемая безопасность вместо точности снимка. Если нужен **настоящий snapshot**, его строят явно: `Object[] snap = map.keySet().toArray();` или `Map<K,V> snap = new HashMap<>(chm);` (но и тут конструктор `HashMap` итерирует CHM weak-consistent-итератором, так что snap отражает то же «какое-то состояние», а не атомарный снимок).
+
+Сплитераторы CHM (`spliterator()` на `keySet()`, `values()`, `entrySet()`) поддерживают **`Spliterator.CONCURRENT`** характеристику — это формальное обещание JDK, что split/trySplit/forEachRemaining могут идти параллельно с модификациями. Они же используются под капотом `parallelStream()`: для CHM `parallelStream()` действительно даёт корректный параллельный обход, в отличие от `HashMap.parallelStream()`, где гонки с модификацией приводят к UB.
+
+## Псевдокод
+
+Иллюстративные фрагменты, схематично передающие два главных пути в `putVal` (см. OpenJDK [[2](#ref-jdk-chm)] для полной реализации).
+
+### CAS на пустой корзине
+
+```java
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    int hash = spread(key.hashCode());
+    Node<K,V>[] tab = table;
+    int i = (tab.length - 1) & hash;
+    Node<K,V> f = tabAt(tab, i);                       // volatile read
+    if (f == null) {
+        // Пустой bin — пробуем CAS, без synchronized
+        if (casTabAt(tab, i, null,
+                     new Node<>(hash, key, value, null))) {
+            // Успех — bin занят, addCount(1)
+            return null;
+        }
+        // CAS промах — другой поток успел; идём в общий путь
+    }
+    // ... synchronized-ветка или resize-ветка
+}
+```
+
+### Ветка `synchronized` на head
+
+```java
+synchronized (f) {                                     // f — head-узел bin'а
+    if (tabAt(tab, i) == f) {                          // double-check: bin не уехал
+        if (f.hash >= 0) {                             // обычный list-bin
+            int binCount = 0;
+            for (Node<K,V> e = f; ; ++binCount) {
+                if (e.hash == hash &&
+                    (e.key == key || (key != null && key.equals(e.key)))) {
+                    // ключ найден — replace
+                    V oldVal = e.val;
+                    if (!onlyIfAbsent) e.val = value;
+                    return oldVal;
+                }
+                Node<K,V> pred = e;
+                if ((e = e.next) == null) {
+                    pred.next = new Node<>(hash, key, value, null);
+                    if (binCount >= TREEIFY_THRESHOLD - 1)
+                        treeifyBin(tab, i);            // 8 узлов и table.length ≥ 64
+                    return null;
+                }
+            }
+        } else if (f instanceof TreeBin) {
+            // ... putTreeVal через red-black tree
+        }
+    }
+}
+```
+
+Подпись: **схематично**, без обработки `ForwardingNode` (`f.hash == MOVED`), `ReservationNode`, помощи `helpTransfer` и подсчёта в `addCount`. Полный код — в исходнике OpenJDK [[2](#ref-jdk-chm)].
+
+## Сравнение с `ConcurrentSkipListMap`
+
+Оба класса из `java.util.concurrent`, оба — Doug Lea, но решают разные задачи [[2](#ref-jdk-chm)] [[9](#ref-jdk-csm)].
+
+| Свойство | `ConcurrentHashMap` | `ConcurrentSkipListMap` |
+|---|---|---|
+| Внутренняя структура | Hash-таблица + treeified bins | Skip-list (вероятностная иерархия списков) |
+| `get`/`put`/`remove` avg | `O(1)` | `O(log n)` (expected) |
+| Worst case на bin/уровне | `O(log n)` после treeify | `O(log n)` (expected) |
+| Упорядоченность ключей | **Нет**, итерация в произвольном порядке | **Да**, ключи в `Comparator`-порядке |
+| Range queries (`subMap`, `headMap`, `tailMap`) | Нет | Да (через `NavigableMap`) |
+| Реализация концурентности | CAS на пустых bin'ах, `synchronized(head)` на цепочках | Lock-free; CAS на узлах skip-list, helping-pattern в Harris-стиле |
+| Когда выбирать | Произвольный доступ, точечные get/put, кеши | Упорядоченное хранилище, range scans, навигация `firstKey`/`lastKey` |
+
+`ConcurrentSkipListMap` в OpenJDK основан на работах Fraser и Harris (class-comment в исходнике явно ссылается на них). Это lock-free структура; CHM, наоборот, использует `synchronized` на головах bin'ов и не является lock-free в строгом смысле.
+
+Когда выбирать `ConcurrentSkipListMap` вместо CHM:
+- Нужны **range scans**: `subMap(low, high)`, `headMap(k)`, `tailMap(k)`, `firstKey()`, `lastKey()`. CHM их не поддерживает.
+- Нужна **упорядоченная итерация** по ключам в порядке `Comparator` (например, для сериализации в файл с фиксированным порядком).
+- Размер map'а небольшой (десятки тысяч записей) и константный множитель `O(log n)` не существенен. На миллионах записей CHM с `O(1)` get/put выигрывает по latency.
+- Нужна семантика **memtable**: данные приходят с разными ключами, периодически дампятся в отсортированный файл — именно так Cassandra и использует `ConcurrentSkipListMap` [[7](#ref-cassandra-memtable)].
+
+## Сложность
+
+Все оценки даны для Java 8+ (после переписки Doug Lea). Для Java 5/6/7 worst-case `put`/`get` был `O(n)` на длинной цепочке, потому что цепочка в сегменте была линейным списком без treeification. Java 8 добавил `TREEIFY_THRESHOLD = 8` и `TreeBin`, и worst-case стал `O(log n)` за счёт красно-чёрного дерева.
+
+| Операция | Avg (Java 8+) | Worst-case | Память |
+|---|---|---|---|
+| `get(k)` | `O(1)` | `O(log n)` (treeify) | — |
+| `put(k, v)` | `O(1)` амортизированно | `O(log n)` на treeify, `O(n)` на resize (амортизированно `O(1)`) | — |
+| `remove(k)` | `O(1)` | `O(log n)` | — |
+| `containsKey(k)` | `O(1)` | `O(log n)` | — |
+| `size()` / `mappingCount()` | `O(stripe-count)` | `O(stripe-count)` | — |
+| Итерация | `O(n)` | `O(n)` | — |
+| Resize (полный) | `O(n)` амортизированно, ускоряется помощью | `O(n)` | пиково `O(n)` на `nextTable` |
+| Хранение | — | — | `O(n)` |
+
+До Java 8 worst-case `put`/`get` был `O(n)` на длинной цепочке (hash flooding). Treeification снижает его до `O(log n)`, ценой ~32 байт overhead'а на узел `TreeNode` vs `Node`.
+
+Замечания о memory footprint:
+- Один пустой `ConcurrentHashMap` после Java 8 — порядка 64 байт (header + `table` ссылка + `sizeCtl` + `baseCount` + `counterCells` ссылка). Старая Java 5 версия с 16 пред-аллоцированными сегментами начиналась с нескольких сотен байт.
+- Каждый `Node<K,V>` — заголовок + `hash:int` + три ссылки (`key`, `val`, `next`) ≈ 32 байта без выравнивания + сами ключ/значение.
+- `TreeNode` добавляет `parent`, `left`, `right`, `prev`, `red:boolean` — ещё ~32 байта. Поэтому treeification оправдана только при достаточно длинных цепочках; ниже `TREEIFY_THRESHOLD = 8` дерево было бы memory-overhead'ом без пользы.
+
+## Применения в БД и распределённых системах
+
+CHM — один из самых используемых классов JDK в инфраструктурном Java-коде. Ниже — несколько подтверждённых примеров из открытых исходников.
+
+- **Caffeine (Ben Manes).** Высокопроизводительная кеш-библиотека, де-факто стандарт в Java-экосистеме. `BoundedLocalCache` — основной класс — **содержит** поле `final ConcurrentHashMap<Object, Node<K, V>> data;` (не наследуется от CHM, но использует его как хранилище записей) [[4](#ref-caffeine)]. Всё, что выше — eviction-политика (W-TinyLFU), expire-after-write, асинхронный refresh — построено вокруг этого CHM. Caffeine — `com.github.ben-manes.caffeine`, исходник: `caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java`.
+
+- **Apache Kafka, `org.apache.kafka.common.metrics.Metrics`.** Регистр метрик клиента и брокера: три ConcurrentMap-поля, инициализируемые `ConcurrentHashMap` в конструкторе — `metrics: ConcurrentMap<MetricName, KafkaMetric>`, `sensors: ConcurrentMap<String, Sensor>`, `childrenSensors: ConcurrentMap<Sensor, List<Sensor>>` [[5](#ref-kafka-metrics)]. Цена: одно сенсорное обновление в hot path продьюсера/консьюмера, миллионы операций в секунду — CHM обеспечивает lock-free чтения и точечную синхронизацию на записях.
+
+- **Apache Cassandra, memtable.** **Важное различие.** `SkipListMemtable` (основная реализация memtable) использует **`ConcurrentSkipListMap`**, а не CHM: `private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> partitions = new ConcurrentSkipListMap<>();` [[7](#ref-cassandra-memtable)]. Причина — memtable должна поддерживать **упорядоченный** проход для flush'а в SSTable, а CHM не упорядочен. CHM в Cassandra используется в других местах — например, в кешах метаданных таблиц, schema registry, прочих неупорядоченных регистрах.
+
+- **Spring Framework, `DefaultSingletonBeanRegistry.singletonObjects`.** Реестр готовых singleton-бинов: `private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);` [[6](#ref-spring-singletons)]. Каждое разрешение бина по имени — это CHM-`get`; параллельная инициализация контекста и runtime-вызовы `getBean(name)` не требуют глобальной блокировки.
+
+Обобщая, CHM применяется там, где (1) ключевой паттерн доступа — точечный `get`/`put`, без range-запросов; (2) число читателей доминирует над числом писателей; (3) ключи распределены по hash-функции более-менее равномерно. Распределённые системы используют его как **локальный** конкурентный кеш и реестр; для глобального состояния, требующего консенсуса или upon-disk persistence, CHM сам по себе не подходит — нужны Raft/Paxos-уровневые механизмы или внешние хранилища (etcd, ZooKeeper, RocksDB).
+
+## Визуализация: throughput vs число потоков
+
+Канонические измерения CHM против `Hashtable` и `synchronizedMap` есть в *Java Concurrency in Practice* (фигуры 11.3 и 11.4) [[1](#ref-jcip)]: на 4-CPU машине CHM показывал почти линейный рост пропускной способности до 4 потоков и оставался стабильным дальше, тогда как `Hashtable` и `synchronizedMap` выходили на плато уже на 2 потоках.
+
+**Иллюстративные значения, не репродукция Figure 11.3.** Точки на графике ниже подобраны качественно — они отражают характер кривых, описанных в JCiP §11.4.4, но не являются дословным переносом измерений. Конкретные числа из книги в WebFetch недоступны (печатное издание), и выдумывать их под видом репродукции некорректно. Аналогичный disclaimer стоит на странице lock-free для графика Hendler–Shavit SPAA 2004 [[8](#ref-hendler-shavit)].
+
+<ReactECharts
+  style={{ height: 380 }}
+  option={{
+    title: {
+      text: 'Throughput Map-реализаций под контеншеном',
+      subtext: 'По мотивам JCiP §11.4.4 (Goetz et al., fig 11.3). Иллюстративные точки, не measured benchmark.',
+      left: 'center',
+      textStyle: { fontSize: 13 },
+    },
+    tooltip: { trigger: 'axis' },
+    legend: {
+      bottom: 0,
+      data: ['ConcurrentHashMap', 'synchronizedMap (HashMap)', 'Hashtable'],
+    },
+    grid: { left: 70, right: 30, top: 60, bottom: 60 },
+    xAxis: {
+      type: 'log',
+      logBase: 2,
+      name: 'число потоков',
+      nameLocation: 'middle',
+      nameGap: 28,
+      min: 1,
+      max: 32,
+    },
+    yAxis: {
+      type: 'value',
+      name: 'нормализованный throughput',
+      nameLocation: 'middle',
+      nameGap: 55,
+      min: 0,
+      max: 4,
+    },
+    series: [
+      {
+        name: 'ConcurrentHashMap',
+        type: 'line',
+        symbolSize: 8,
+        data: [[1, 1.0], [2, 1.9], [4, 3.5], [8, 3.6], [16, 3.6], [32, 3.5]],
+      },
+      {
+        name: 'synchronizedMap (HashMap)',
+        type: 'line',
+        symbolSize: 8,
+        lineStyle: { type: 'dashed' },
+        data: [[1, 1.0], [2, 0.9], [4, 0.7], [8, 0.55], [16, 0.5], [32, 0.45]],
+      },
+      {
+        name: 'Hashtable',
+        type: 'line',
+        symbolSize: 8,
+        lineStyle: { type: 'dashed' },
+        data: [[1, 0.95], [2, 0.85], [4, 0.65], [8, 0.5], [16, 0.45], [32, 0.4]],
+      },
+    ],
+  }}
+/>
+
+Главный вывод: глобальный монитор (`Hashtable`, `synchronizedMap`) деградирует под нагрузкой из-за cache-line ping-pong на единственном мьютексе, а CHM держит почти линейный рост, пока корзины распределены равномерно. На сильно перекошенном hash-распределении (все потоки бьют один и тот же ключ) и CHM деградирует — но до `synchronized(head)` на единственном bin'е, а не до глобального лока.
+
+Для воспроизводимых measurements рекомендуется фреймворк **JMH** (Java Microbenchmark Harness, OpenJDK). Типичный микро-бенчмарк CHM включает warmup'ы (для JIT-компиляции hot path), измерение в нескольких режимах (`Throughput`, `AverageTime`), и явный контроль аллокаций через `BlackHole` для предотвращения dead-code elimination. Без JMH большинство «домашних» микро-бенчмарков измеряют GC и JIT-варм-ап, а не саму структуру.
+
+## Подводные камни
+
+- **Рекурсивный `computeIfAbsent` на тот же ключ.** Лямбда внутри `computeIfAbsent`, вызывающая `map.computeIfAbsent(sameOrCollidingKey, ...)`, может уйти в re-entry на `synchronized(head)` (для того же ключа допустимо) или **заблокироваться** на другом ключе в том же bin'е. В Java 9+ JDK-8172951 добавил детекцию некоторых случаев с `IllegalStateException`. Правило: **не вызывайте CHM-операции из лямбды**, переданной в `compute*` — выносите вычисление наружу.
+- **Итератор не snapshot.** `for (var e : map.entrySet())` отражает состояние «в какой-то момент» и не гарантирует, что увидит запись, добавленную после начала итерации (и наоборот — может пропустить запись, удалённую во время итерации). Для настоящего snapshot — `Object[] snap = map.keySet().toArray();` (атомарность только на момент `toArray`).
+- **`size()` int vs `mappingCount()` long.** В таблицах с числом записей > 2^31 (теоретически возможно при `MAXIMUM_CAPACITY = 1 << 30` бинах с цепочками) `size()` насыщается. Используйте `mappingCount()` для больших таблиц.
+- **Запрет `null`.** `map.put(k, null)` или `map.get(null)` бросит `NullPointerException`. Если нужна семантика «значение известно как отсутствующее» — используйте `Optional<V>` как тип значения или sentinel-объект, **не** `null`.
+- **Hash flooding.** Treeification смягчает атаку, но не убирает: дерево даёт `O(log n)` на корзину, но злонамеренные ключи всё ещё могут раздуть память. Для untrusted input (например, HTTP-параметры в кеше) ставьте **cap на длину ключа** и **на размер map'а**, или используйте hash с секретом (SipHash, как в Rust `HashMap`).
+- **`putIfAbsent` vs `computeIfAbsent`.** Оба атомарны, но `putIfAbsent` принимает уже готовое значение — если вы выполняете дорогое вычисление и проигрываете гонку, значение просто отбрасывается. `computeIfAbsent` гарантирует, что лямбда выполнится **ровно один раз** для отсутствующего ключа, что критично если вычисление дорогое (загрузка из БД, HTTP-запрос). Правило: для дешёвых значений — `putIfAbsent`, для дорогих — `computeIfAbsent`.
+- **Атомарность compose-операций — только для одного ключа.** `map.computeIfAbsent(k1, ...)` и `map.computeIfAbsent(k2, ...)`, выполненные одним потоком в одной транзакции, **не атомарны** относительно других потоков как пара: другой поток может увидеть, что `k1` уже есть, а `k2` ещё нет. Если нужна транзакционность над несколькими ключами, CHM сам по себе не достаточен — используйте внешний `synchronized`-блок (с осознанием того, что это сводит на нет преимущества CHM) или транзакционную память / persistent collections.
+
+## Decision matrix
+
+| Сценарий | Рекомендация |
+|---|---|
+| Точечный доступ, кеши, registry, метрики — высокий контеншен | **`ConcurrentHashMap`** |
+| Упорядоченное хранилище, range scans, навигация (`firstKey`/`subMap`) | **`ConcurrentSkipListMap`** |
+| Read-mostly, обновления редкие; число чтений ≫ записей | **`CopyOnWriteMap`-подобные** структуры или immutable + atomic swap ссылки |
+| Малая нагрузка, простой код, тесты, < 100 потоков с redundant locking | `Collections.synchronizedMap(...)` (legacy-стиль, не рекомендуется для нового кода) |
+| Безусловно read-only после построения | `Map.copyOf(...)` / `Collections.unmodifiableMap(...)` — даёт документированный immutable-контракт и снимает overhead concurrency-машинерии |
+| Очень большие таблицы, off-heap, persistence | Внешние библиотеки (Chronicle Map, MapDB, RocksDB) — CHM ограничен heap'ом |
+
+## Список литературы
+
+1. <a id="ref-jcip"></a> Goetz, B., Peierls, T., Bloch, J., Bowbeer, J., Holmes, D., & Lea, D. (2006). **Java Concurrency in Practice**. Addison-Wesley. ISBN 0-321-34960-1. §4.4.1 «Monitor-based classes», §5.1–5.2 о synchronized-collections и atomic compound actions, §11.4.4 (figures 11.3, 11.4) с измерениями throughput CHM/Hashtable/synchronizedMap. [jcip.net](https://jcip.net/)
+
+2. <a id="ref-jdk-chm"></a> OpenJDK. **`java/util/concurrent/ConcurrentHashMap.java`** (HEAD-исходник). `@author Doug Lea`, `@since 1.5`. Источник всех констант (`TREEIFY_THRESHOLD = 8`, `UNTREEIFY_THRESHOLD = 6`, `MIN_TREEIFY_CAPACITY = 64`, `DEFAULT_CAPACITY = 16`, `MAXIMUM_CAPACITY = 1 << 30`, `LOAD_FACTOR = 0.75f`, `MIN_TRANSFER_STRIDE = 16`, `RESIZE_STAMP_BITS = 16`, `MOVED = -1`, `TREEBIN = -2`, `RESERVED = -3`) и javadoc-цитат об atomicity, weakly consistent итераторах и null-запрете. [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentHashMap.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentHashMap.java)
+
+3. <a id="ref-jsr166"></a> Lea, D. (specification lead). **JSR-166: Concurrency Utilities**. Финализирована 30 сентября 2004, включена в Java 1.5 как пакет `java.util.concurrent`. ConcurrentHashMap — один из исходных классов JSR-166. [jcp.org/en/jsr/detail?id=166](https://jcp.org/en/jsr/detail?id=166)
+
+4. <a id="ref-caffeine"></a> Manes, B. **Caffeine: a high performance, near optimal caching library** (исходник GitHub). Класс `BoundedLocalCache` содержит поле `final ConcurrentHashMap<Object, Node<K, V>> data;` как основное хранилище записей. [github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java](https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/BoundedLocalCache.java)
+
+5. <a id="ref-kafka-metrics"></a> Apache Kafka. **`org.apache.kafka.common.metrics.Metrics`** (HEAD-исходник). Три поля `ConcurrentMap<MetricName, KafkaMetric>`, `ConcurrentMap<String, Sensor>`, `ConcurrentMap<Sensor, List<Sensor>>` инициализируются `new ConcurrentHashMap<>()` в конструкторе. Используются в hot path метрик клиента и брокера. [github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/metrics/Metrics.java](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/metrics/Metrics.java)
+
+6. <a id="ref-spring-singletons"></a> Spring Framework. **`DefaultSingletonBeanRegistry.java`** (HEAD-исходник, ветка `main`). Поле `private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);` — реестр готовых singleton-бинов; на нём держится разрешение `getBean(String)` по имени. [github.com/spring-projects/spring-framework/blob/main/spring-beans/src/main/java/org/springframework/beans/factory/support/DefaultSingletonBeanRegistry.java](https://github.com/spring-projects/spring-framework/blob/main/spring-beans/src/main/java/org/springframework/beans/factory/support/DefaultSingletonBeanRegistry.java)
+
+7. <a id="ref-cassandra-memtable"></a> Apache Cassandra. **`org.apache.cassandra.db.memtable.SkipListMemtable`** (HEAD-исходник). Поле `private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> partitions = new ConcurrentSkipListMap<>();` — основное хранилище partition'ов memtable; **не** CHM, чтобы поддерживать упорядоченный flush в SSTable. [github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/memtable/SkipListMemtable.java](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/memtable/SkipListMemtable.java)
+
+8. <a id="ref-hendler-shavit"></a> Hendler, D., Shavit, N., & Yerushalmi, L. (2004). **A Scalable Lock-Free Stack Algorithm**. In *SPAA '04*, 206–215. DOI 10.1145/1007912.1007944. Использовано как образец disclaimer'а «иллюстративные точки, не measured benchmark» (см. соседнюю страницу lock-free). [doi.org/10.1145/1007912.1007944](https://doi.org/10.1145/1007912.1007944)
+
+9. <a id="ref-jdk-csm"></a> OpenJDK. **`java/util/concurrent/ConcurrentSkipListMap.java`** (HEAD-исходник). `@author Doug Lea`. Class-level comment ссылается на работы Fraser и Harris; реализация — lock-free skip-list, в контраст со `synchronized(head)`-подходом CHM. [github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentSkipListMap.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentSkipListMap.java)
