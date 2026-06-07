@@ -203,7 +203,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 - **RCU в ядре Linux.** dcache (path lookup), маршрутизация (FIB), BPF-карты — read-side вообще без атомарных операций; обновление через copy + swap + synchronize_rcu. Документация ядра `Documentation/RCU/whatisRCU.rst` [[14](#ref-rcu-doc)].
 - **Lock-free buffer pools.** Современные in-memory СУБД и cache-layer (LeanStore, Umbra) применяют CLOCK-replacement с атомарным reference-bit и lock-free-захватом frame'ов через CAS на состоянии страницы.
 
-См. также параллельные конструкции в Java: [Concurrent Hash Map](../java/concurrent-hash-map.md) и [иммутабельные / persistent структуры](../immutable/immutable-vs-persistent.md), где блокировка избегается принципиально иначе — через структурное разделение ссылок.
+См. также параллельные конструкции в Java: [Concurrent Hash Map](../java/concurrent-hash-map.mdx) и [иммутабельные / persistent структуры](../immutable/immutable-vs-persistent.md), где блокировка избегается принципиально иначе — через структурное разделение ссылок.
 
 ## Визуализация: пропускная способность под контеншеном
 
