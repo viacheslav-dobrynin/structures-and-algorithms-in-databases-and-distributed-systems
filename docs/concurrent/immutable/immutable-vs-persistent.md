@@ -208,7 +208,7 @@ ceil(3.99) = 4
 
 5. <a id="ref-fingertree"></a> Hinze, R., & Paterson, R. (2006). **Finger Trees: A Simple General-purpose Data Structure**. *Journal of Functional Programming*, 16(2), 197–217. [doi.org/10.1017/S0956796805005769](https://doi.org/10.1017/S0956796805005769)
 
-6. <a id="ref-couchdb"></a> Apache CouchDB. **The Power of B-trees** и описание append-only хранилища. Официальная документация Apache CouchDB. [docs.couchdb.org/en/stable/intro/overview.html](https://docs.couchdb.org/en/stable/intro/overview.html)
+6. <a id="ref-couchdb"></a> Apache CouchDB. **Technical Overview** — append-only хранилище и устойчивые к сбоям MVCC-чтения через B+деревья (раздел «ACID Properties»). Официальная документация Apache CouchDB. [docs.couchdb.org/en/stable/intro/overview.html](https://docs.couchdb.org/en/stable/intro/overview.html)
 
 7. <a id="ref-lmdb"></a> Chu, H. (Symas Corp.). **LMDB: Lightning Memory-Mapped Database — Technical Information**. Описание copy-on-write B+дерева, single-writer MVCC и неблокирующих читателей. [www.symas.com/lmdb](https://www.symas.com/lmdb)
 
