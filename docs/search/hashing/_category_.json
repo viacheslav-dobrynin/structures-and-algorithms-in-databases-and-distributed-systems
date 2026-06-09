@@ -3,7 +3,7 @@
   "position": 5,
   "link": {
     "type": "generated-index",
-    "description": "5 minutes to learn the most important Docusaurus concepts.",
+    "description": "Хеширование и построенные на нём структуры данных: деревья Меркла и проверка целостности данных.",
     "slug": "/category/search/hashing"
   }
 }

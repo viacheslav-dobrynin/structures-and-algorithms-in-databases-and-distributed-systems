@@ -3,7 +3,7 @@
   "position": 1,
   "link": {
     "type": "generated-index",
-    "description": "5 minutes to learn the most important Docusaurus concepts.",
+    "description": "Неблокирующие (lock-free и wait-free) структуры данных: атомарные примитивы, условия прогресса, проблема ABA и освобождение памяти.",
     "slug": "/category/concurrent/lock-free"
   }
 }

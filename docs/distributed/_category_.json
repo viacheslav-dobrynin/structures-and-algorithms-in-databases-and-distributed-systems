@@ -3,7 +3,7 @@
   "position": 3,
   "link": {
     "type": "generated-index",
-    "description": "5 minutes to learn the most important Docusaurus concepts.",
+    "description": "Алгоритмы и структуры данных для распределённых систем: репликация, согласованность и бесконфликтные реплицируемые типы данных.",
     "slug": "/category/distributed"
   }
 }

@@ -3,6 +3,7 @@
   "position": 1,
   "link": {
     "type": "generated-index",
+    "description": "Пространственные индексы для геоданных: R-деревья, R*-деревья и их применение в PostGIS.",
     "slug": "/category/search/spatial-indexes"
   }
 }

@@ -61,7 +61,7 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'Описание',
+      title: 'Главная',
       logo: {
         alt: 'Site Logo',
         src: 'img/logo.svg',

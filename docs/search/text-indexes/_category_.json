@@ -3,7 +3,7 @@
   "position": 4,
   "link": {
     "type": "generated-index",
-    "description": "5 minutes to learn the most important Docusaurus concepts.",
+    "description": "Текстовые индексы для полнотекстового поиска: инвертированный индекс, ранжирование (TF-IDF, BM25) и сжатие списков вхождений.",
     "slug": "/category/search/text-indexes"
   }
 }
