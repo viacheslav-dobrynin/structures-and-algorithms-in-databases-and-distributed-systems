@@ -80,6 +80,31 @@ const config: Config = {
         },
       ],
     },
+    footer: {
+      style: 'dark',
+      links: [
+        {
+          title: 'Материалы',
+          items: [
+            { label: 'Поиск', to: '/docs/category/search' },
+            { label: 'Конкурентность', to: '/docs/category/concurrent' },
+            { label: 'Распределённые системы', to: '/docs/category/distributed' },
+            { label: 'Компактные структуры', to: '/docs/category/compact' },
+          ],
+        },
+        {
+          title: 'Ссылки',
+          items: [
+            { label: 'Университет ИТМО', href: 'https://itmo.ru/' },
+            {
+              label: 'GitHub',
+              href: 'https://github.com/viacheslav-dobrynin/structures-and-algorithms-in-databases-and-distributed-systems',
+            },
+          ],
+        },
+      ],
+      copyright: `© ${new Date().getFullYear()} Университет ИТМО, Факультет программной инженерии и компьютерной техники. Сделано с помощью Docusaurus.`,
+    },
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,

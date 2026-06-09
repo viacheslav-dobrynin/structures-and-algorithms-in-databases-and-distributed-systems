@@ -8,6 +8,13 @@ import Heading from '@theme/Heading';
 
 import styles from './index.module.css';
 
+const categories = [
+  { to: '/docs/category/search', label: 'Поиск 🔍' },
+  { to: '/docs/category/concurrent', label: 'Конкурентность ⚙️' },
+  { to: '/docs/category/distributed', label: 'Распределённые системы 🌐' },
+  { to: '/docs/category/compact', label: 'Компактные структуры 📦' },
+];
+
 function HomepageHeader() {
   const { siteConfig } = useDocusaurusContext();
   return (
@@ -18,11 +25,14 @@ function HomepageHeader() {
         </Heading>
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
-          <Link
-            className="button button--secondary button--lg"
-            to="/docs/category/search">
-            Материалы дисциплины 📚
-          </Link>
+          {categories.map((category) => (
+            <Link
+              key={category.to}
+              className="button button--secondary button--lg"
+              to={category.to}>
+              {category.label}
+            </Link>
+          ))}
         </div>
       </div>
     </header>
