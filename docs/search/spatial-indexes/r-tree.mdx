@@ -30,23 +30,44 @@ import ReactECharts from 'echarts-for-react';
     {
       type: 'scatter',
       symbolSize: 10,
-      data: [[2, 3], [4, 6], [5, 4], [8, 7], [9, 3]],
-      itemStyle: { color: '#5470c6' },
+      data: [[2, 3], [3, 6], [4, 4], [8, 4], [9, 7], [10, 5]],
+      itemStyle: { color: '#3b3b3b' },
+      z: 3,
     },
     {
+      name: 'R1',
       type: 'line',
-      data: [[2, 3], [9, 3], [9, 7], [2, 7], [2, 3]],
-      lineStyle: { color: '#ee6666', width: 2, type: 'dashed' },
-      itemStyle: { opacity: 0 },
-      label: { show: true, formatter: 'MBR', position: 'insideTopLeft', fontSize: 14, color: '#ee6666' },
+      data: [[2, 3], [4, 3], [4, 6], [2, 6], [2, 3]],
+      lineStyle: { color: '#5470c6', width: 2, type: 'dashed' },
       showSymbol: false,
-      areaStyle: { color: 'rgba(238, 102, 102, 0.08)' },
+      label: { show: true, formatter: 'R1', position: 'insideTopLeft', fontSize: 13, color: '#5470c6' },
+      areaStyle: { color: 'rgba(84, 112, 198, 0.10)' },
+      z: 2,
+    },
+    {
+      name: 'R2',
+      type: 'line',
+      data: [[8, 4], [10, 4], [10, 7], [8, 7], [8, 4]],
+      lineStyle: { color: '#91cc75', width: 2, type: 'dashed' },
+      showSymbol: false,
+      label: { show: true, formatter: 'R2', position: 'insideTopLeft', fontSize: 13, color: '#5a9c40' },
+      areaStyle: { color: 'rgba(145, 204, 117, 0.12)' },
+      z: 2,
+    },
+    {
+      name: 'R0',
+      type: 'line',
+      data: [[2, 3], [10, 3], [10, 7], [2, 7], [2, 3]],
+      lineStyle: { color: '#ee6666', width: 2 },
+      showSymbol: false,
+      label: { show: true, formatter: 'R0 (родитель)', position: 'insideBottomLeft', fontSize: 13, color: '#ee6666' },
+      z: 1,
     },
   ],
   tooltip: { trigger: 'item', formatter: '({c})' },
 }} />
 
-Любой пространственный объект — точка, линия, полигон — может быть аппроксимирован своим MBR. Это позволяет свести сложные геометрические проверки к простым сравнениям координат прямоугольников.
+Здесь два дочерних MBR — `R1` и `R2` — оборачивают по группе объектов, а родительский MBR `R0` покрывает оба дочерних прямоугольника. Так MBR работают на каждом уровне дерева: на нижнем они аппроксимируют сами объекты, на верхних — группы вложенных MBR. Любой пространственный объект — точка, линия, полигон — может быть аппроксимирован своим MBR, что сводит сложные геометрические проверки к простым сравнениям координат прямоугольников.
 
 ### Узлы и свойства дерева
 
@@ -60,15 +81,49 @@ R-дерево является сбалансированным деревом 
 
 Типичная структура R-дерева:
 
-```
-           [R0]                     <- корень (MBR покрывает всё)
-          /    \
-      [R1]      [R2]               <- внутренние узлы
-      / \        / \
-   [L1] [L2]  [L3] [L4]           <- листовые узлы
-   /|\   /|\   /|\   /|\
-  объекты...                       <- пространственные объекты
-```
+<ReactECharts option={{
+  tooltip: { trigger: 'item', triggerOn: 'mousemove' },
+  series: [
+    {
+      type: 'tree',
+      data: [
+        {
+          name: 'R0',
+          children: [
+            {
+              name: 'R1',
+              children: [
+                { name: 'L1', children: [{ name: 'объекты' }, { name: 'объекты ' }] },
+                { name: 'L2', children: [{ name: 'объекты  ' }, { name: 'объекты   ' }] },
+              ],
+            },
+            {
+              name: 'R2',
+              children: [
+                { name: 'L3', children: [{ name: 'объекты    ' }, { name: 'объекты     ' }] },
+                { name: 'L4', children: [{ name: 'объекты      ' }, { name: 'объекты       ' }] },
+              ],
+            },
+          ],
+        },
+      ],
+      top: '5%',
+      bottom: '5%',
+      left: '7%',
+      right: '7%',
+      orient: 'vertical',
+      symbol: 'roundRect',
+      symbolSize: [44, 24],
+      label: { position: 'inside', fontSize: 12, color: '#fff' },
+      itemStyle: { color: '#5470c6', borderColor: '#5470c6' },
+      lineStyle: { color: '#aaa', width: 1.5 },
+      expandAndCollapse: false,
+      animationDuration: 400,
+    },
+  ],
+}} style={{ height: '360px' }} />
+
+Корень `R0` и внутренние узлы `R1`, `R2` хранят MBR дочерних узлов; листовые узлы `L1`–`L4` хранят MBR самих пространственных объектов. Все листья находятся на одном уровне.
 
 Параметр `M` обычно выбирается исходя из размера дисковой страницы. Например, при размере страницы 4 КБ и размере записи около 40 байт (четыре координаты по 8 байт + указатель 8 байт на 64-битной системе) в один узел помещается порядка 100 записей. Оценка иллюстративная: конкретное значение зависит от выравнивания, служебных полей узла и формата хранения.
 
