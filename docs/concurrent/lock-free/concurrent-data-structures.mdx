@@ -28,7 +28,7 @@ import ReactECharts from 'echarts-for-react';
 - **Lock-free.** Если несколько потоков параллельно выполняют операции на структуре, **хотя бы один** завершит свою операцию за конечное число шагов. Никакая задержка отдельного потока не блокирует систему в целом, но конкретный поток может быть бесконечно «обделён» (starvation).
 - **Wait-free.** **Каждый** поток завершает свою операцию за **ограниченное** число своих собственных шагов, независимо от поведения других. Сильнейшая гарантия; обязательна для жёсткого real-time.
 
-Свойства **monotonic strict total order**: wait-free ⟹ lock-free ⟹ obstruction-free. Lock-free структура автоматически obstruction-free, но не наоборот.
+Эти условия образуют строгую иерархию по силе гарантии: wait-free ⟹ lock-free ⟹ obstruction-free. Lock-free структура автоматически obstruction-free, но не наоборот.
 
 | Условие прогресса | Гарантия | Цена в коде | Канонические примеры |
 |---|---|---|---|
@@ -37,7 +37,7 @@ import ReactECharts from 'echarts-for-react';
 | Lock-free | Хоть кто-то прогрессирует всегда | RMW-цикл, ABA-защита, безопасное освобождение | Treiber stack, Michael–Scott queue, Harris list |
 | Wait-free | Каждый прогрессирует за O(1) шагов | помощь чужим операциям, FAA-индексы, announce-tables | Kogan–Petrank queue (PPoPP 2011) [[16](#ref-kogan-petrank)] |
 
-В практическом языке слово «lock-free» употребляется неточно: им называют любую неблокирующую конструкцию. Например, `java.util.concurrent.ConcurrentLinkedQueue` — **lock-free, но не wait-free**: javadoc явно говорит, что это вариант алгоритма Майкла–Скотта PODC 1996, в котором поток-неудачник в гонке за `tail` повторяет CAS-цикл [[12](#ref-clq-source)]. Wait-free-варианты той же задачи существуют (Kogan–Petrank, PPoPP 2011 [[16](#ref-kogan-petrank)]), но они дороже на низком контеншене и редко используются вне real-time-сред.
+В практическом языке слово «lock-free» употребляется неточно: им называют любую неблокирующую конструкцию. Например, `java.util.concurrent.ConcurrentLinkedQueue` — **lock-free, но не wait-free**: комментарий в исходном коде класса (Doug Lea) явно указывает, что это вариант алгоритма Майкла–Скотта PODC 1996, в котором поток-неудачник в гонке за `tail` повторяет CAS-цикл [[12](#ref-clq-source)]. Wait-free-варианты той же задачи существуют (Kogan–Petrank, PPoPP 2011 [[16](#ref-kogan-petrank)]), но они дороже на низком контеншене и редко используются вне real-time-сред.
 
 ## Атомарные примитивы и память
 
@@ -108,7 +108,7 @@ void push(T v) {
 
 Способы защиты:
 
-- **Tagged-pointer / counted-pointer.** Хранить пару `(ptr, tag)` атомарно; tag растёт на каждом CAS. На x86-64 — 16-байтная пара через `CMPXCHG16B` (DCAS на одном слове 128 бит).
+- **Tagged-pointer / counted-pointer.** Хранить пару `(ptr, tag)` атомарно; tag растёт на каждом CAS. На x86-64 — 16-байтная пара через `CMPXCHG16B` (double-width CAS, DWCAS: атомарный CAS над одним 128-битным словом — не путать с DCAS над двумя независимыми адресами).
 - **Hazard pointers** (Michael 2004) [[3](#ref-hazard-pointers)] — явный реестр «я сейчас читаю X»; reclaimer не освобождает X, пока кто-то его помечает.
 - **Epoch-based reclamation (EBR)** — Fraser 2004 [[5](#ref-fraser)] — потоки помечают эпоху на входе в критическую секцию; reclaimer освобождает узел, ушедший в две эпохи назад.
 - **RCU (Read-Copy-Update)** — близкий по идее механизм в ядре Linux: писатели делают копию + atomic swap + grace period; читатели вообще без синхронизации [[14](#ref-rcu-doc)].
@@ -170,7 +170,7 @@ Cliff Click опубликовал (2007) NonBlockingHashMap для Java на п
 
 Keir Fraser, *Practical Lock-Freedom*, Cambridge UCAM-CL-TR-579 (2004) [[5](#ref-fraser)]; Fraser & Harris (2007). Каждый уровень skip-list'а — Harris-список с маркером удаления; вставка идёт снизу вверх через серию CAS, удаление — пометка на каждом уровне + физический unlink. `O(log n)` ожидаемая стоимость, никаких глобальных замков.
 
-**Production user:** OpenJDK `java.util.concurrent.ConcurrentSkipListMap` — концурентный навигируемый map на skip-list'е. class-level комментарий в исходнике (Doug Lea) явно указывает, что реализация основана на работах Fraser и Harris [[13](#ref-cslm-javadoc)].
+**Production user:** OpenJDK `java.util.concurrent.ConcurrentSkipListMap` — концурентный навигируемый map на skip-list'е. class-level комментарий в исходнике (Doug Lea) указывает, что базовые списки реализованы по алгоритму **HM** (Harris–Maged Michael), а работа Fraser упомянута как родственная (related) [[13](#ref-cslm-javadoc)].
 
 ### Bw-tree (ICDE 2013)
 
@@ -199,7 +199,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 
 - **Bw-tree → SQL Server Hekaton.** Latch-free B-tree, описанный в ICDE 2013 [[7](#ref-bw-tree)], работает в production-движке in-memory OLTP Microsoft SQL Server, в Azure Cosmos DB и Bing.
 - **MVCC snapshot pointers.** В PostgreSQL и Oracle переход к новой версии строки — атомарная установка указателя в её tuple-header. Читатели с активным snapshot'ом видят старую версию без всякой блокировки; vacuum / undo-механизм играет роль reclamation'а с условиями, аналогичными EBR (нет активных читателей старше определённого xmin).
-- **Lock-free WAL append / log queues.** В PostgreSQL `WALInsertLock` исторически был bottleneck'ом и начиная с 9.4 шардирован на 8 слотов с lock-free reservation позиции через FAA [[19](#ref-postgres-lwlock)]. **LMAX Disruptor** [[15](#ref-disruptor)] — кольцевой буфер с FAA-резервацией позиций; сами авторы аккуратно отмечают, что Disruptor **lock-free**, но **не wait-free**: при коллизии producer'ы могут выполнять несколько CAS, и формально один из них может бесконечно проигрывать.
+- **WAL append / log queues.** В PostgreSQL `WALInsertLock` исторически был bottleneck'ом и начиная с 9.4 шардирован на 8 слотов (`NUM_XLOGINSERT_LOCKS`). Саму позицию вставки в WAL поток резервирует в `ReserveXLogInsertLocation()` под отдельным спинлоком `insertpos_lck` (короткий read-modify-write над `CurrBytePos`), а не атомарным FAA [[19](#ref-postgres-lwlock)]. **LMAX Disruptor** [[15](#ref-disruptor)] — кольцевой буфер, где несколько producer'ов резервируют позиции через CAS; это делает его **lock-free, но не wait-free**: при коллизии producer'ы повторяют CAS, и формально один из них может бесконечно проигрывать.
 - **RCU в ядре Linux.** dcache (path lookup), маршрутизация (FIB), BPF-карты — read-side вообще без атомарных операций; обновление через copy + swap + synchronize_rcu. Документация ядра `Documentation/RCU/whatisRCU.rst` [[14](#ref-rcu-doc)].
 - **Lock-free buffer pools.** Современные in-memory СУБД и cache-layer (LeanStore, Umbra) применяют CLOCK-replacement с атомарным reference-bit и lock-free-захватом frame'ов через CAS на состоянии страницы.
 
@@ -323,7 +323,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 
 14. <a id="ref-rcu-doc"></a> McKenney, P. E. et al. **What is RCU, Fundamentally?** Документация ядра Linux, `Documentation/RCU/whatisRCU.rst`. Содержит формальные требования к grace-period detection и read-side primitive `rcu_dereference`. [www.kernel.org/doc/html/latest/RCU/whatisRCU.html](https://www.kernel.org/doc/html/latest/RCU/whatisRCU.html)
 
-15. <a id="ref-disruptor"></a> Thompson, M., Farley, D., Barker, M., Gee, P., & Stewart, A. (2011). **Disruptor: High Performance Alternative to Bounded Queues for Exchanging Data Between Concurrent Threads**. LMAX Technical Paper. Сами авторы фиксируют, что Disruptor lock-free, **но не wait-free**: producer'ы конкурируют за позиции через CAS, и один из них может проигрывать гонку неограниченно долго. [lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf](https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf)
+15. <a id="ref-disruptor"></a> Thompson, M., Farley, D., Barker, M., Gee, P., & Stewart, A. (2011). **Disruptor: High Performance Alternative to Bounded Queues for Exchanging Data Between Concurrent Threads**. LMAX Technical Paper. Описывает multi-producer ring buffer, где producer'ы резервируют позиции через CAS; статья характеризует алгоритм как lock-free. Отсюда же следует, что он **не wait-free**: при конкуренции один producer может проигрывать гонку CAS неограниченно долго (это вывод из механики CAS, а не дословная формулировка авторов). [lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf](https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf)
 
 16. <a id="ref-kogan-petrank"></a> Kogan, A., & Petrank, E. (2011). **Wait-Free Queues with Multiple Enqueuers and Dequeuers**. In *PPoPP '11*, 223–234. DOI 10.1145/1941553.1941585. Первая wait-free FIFO-очередь с произвольным числом потоков, основанная на helping и announce-array. [doi.org/10.1145/1941553.1941585](https://doi.org/10.1145/1941553.1941585)
 
@@ -331,7 +331,7 @@ Hazard pointers и EBR применимы из user-space; RCU историче�
 
 18. <a id="ref-pathfinder"></a> Reeves, G. E. (1997). **What Really Happened on Mars?** Authoritative account of the Mars Pathfinder priority-inversion bug; VxWorks mutex без флага priority inheritance. [www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html](https://www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html)
 
-19. <a id="ref-postgres-lwlock"></a> PostgreSQL Global Development Group. **WAL insertion locks (`xlog.c`)**. Файл `src/backend/access/transam/xlog.c` определяет `NUM_XLOGINSERT_LOCKS = 8` и массив `WALInsertLocks` — шардирование `WALInsertLock` на 8 слотов с lock-free reservation позиции через FAA. [github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c](https://github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c)
+19. <a id="ref-postgres-lwlock"></a> PostgreSQL Global Development Group. **WAL insertion locks (`xlog.c`)**. Файл `src/backend/access/transam/xlog.c` определяет `NUM_XLOGINSERT_LOCKS = 8` и массив `WALInsertLocks` (шардирование `WALInsertLock` на 8 слотов); позицию вставки функция `ReserveXLogInsertLocation()` резервирует под спинлоком `insertpos_lck` (read-modify-write над `Insert->CurrBytePos`), а не атомарным FAA. [github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c](https://github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c)
 
 20. <a id="ref-hendler-shavit"></a> Hendler, D., Shavit, N., & Yerushalmi, L. (2004). **A Scalable Lock-Free Stack Algorithm**. In *SPAA '04*, 206–215. DOI 10.1145/1007912.1007944. Источник численных данных для графика выше (Figure 7, 14-node Sun Enterprise E6500, 50% push / 50% pop). [doi.org/10.1145/1007912.1007944](https://doi.org/10.1145/1007912.1007944)
 
