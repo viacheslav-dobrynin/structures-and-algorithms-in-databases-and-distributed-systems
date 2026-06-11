@@ -148,9 +148,9 @@ Doug Lea переписал CHM целиком. Сегменты исчезли.
 
 - Лямбда выполняется ровно один раз для отсутствующего ключа.
 - Никакой другой поток не увидит ключ в полусобранном состоянии.
-- **Подводный камень:** если внутри `computeIfAbsent` вызвать тот же `map.computeIfAbsent` на тот же ключ — поток попробует взять `synchronized` повторно (re-entry допустим), но если **другой** ключ попадает в **тот же bin** и блокируется — возможен deadlock. Javadoc прямо предупреждает:
+- **Подводный камень:** если внутри `computeIfAbsent` вызвать тот же `map.computeIfAbsent` на тот же ключ — поток попробует взять `synchronized` повторно (re-entry допустим), но если **другой** ключ попадает в **тот же bin** и блокируется — возможен deadlock. Javadoc compute-методов прямо предупреждает; наиболее полно — у `merge`:
 
-> *Some attempted update operations on this map by other threads may be blocked while computation is in progress, so the computation should be short and simple, and must not attempt to update any other mappings of this map.*
+> *Some attempted update operations on this map by other threads may be blocked while computation is in progress, so the computation should be short and simple, and must not attempt to update any other mappings of this Map.*
 
 Это не теоретическое опасение: bug-репорт [JDK-8062841](https://bugs.openjdk.org/browse/JDK-8062841) («*ConcurrentHashMap.computeIfAbsent stuck in an endless loop*», дубликат — [JDK-8074374](https://bugs.openjdk.org/browse/JDK-8074374)) фиксировал именно такое зависание; в результате в современный CHM добавлена детекция рекурсивного обновления, бросающая `IllegalStateException` с сообщением «*Recursive update*».
 
